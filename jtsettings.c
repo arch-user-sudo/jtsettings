@@ -978,6 +978,70 @@ static void paint_nav_icon(cairo_t *cr, int page, double x, double y,
     }
 }
 
+/* Soft radial glows are extremely expensive for Cairo to evaluate per pixel
+ * over a full window, so pre-render each one once into a small sprite and
+ * paint that scaled.  The glows are low-alpha and smooth, so bilinear
+ * scaling is visually indistinguishable. */
+#define GLOW_SIZE 256
+
+static cairo_surface_t *g_ambient_glow;
+static cairo_surface_t *g_sidebar_glow;
+static unsigned g_glow_accent;
+
+static cairo_surface_t *glow_make(int size, double inner_ratio,
+                                  unsigned rgb, double a0, double amid)
+{
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                    size, size);
+    cairo_t *cr = cairo_create(s);
+    double c = size / 2.0;
+    cairo_pattern_t *p = cairo_pattern_create_radial(
+        c, c, c * inner_ratio, c, c, c);
+    cairo_pattern_add_color_stop_rgba(p, 0.0,
+        R_(rgb), G_(rgb), B_(rgb), a0);
+    if (amid >= 0.0)
+        cairo_pattern_add_color_stop_rgba(p, 0.55,
+            R_(rgb), G_(rgb), B_(rgb), amid);
+    cairo_pattern_add_color_stop_rgba(p, 1.0,
+        R_(rgb), G_(rgb), B_(rgb), 0.0);
+    cairo_set_source(cr, p);
+    cairo_paint(cr);
+    cairo_pattern_destroy(p);
+    cairo_destroy(cr);
+    return s;
+}
+
+static void glow_ensure(void)
+{
+    if (g_glow_accent == accent_rgb && g_ambient_glow && g_sidebar_glow)
+        return;
+    if (g_ambient_glow) {
+        cairo_surface_destroy(g_ambient_glow);
+        g_ambient_glow = NULL;
+    }
+    if (g_sidebar_glow) {
+        cairo_surface_destroy(g_sidebar_glow);
+        g_sidebar_glow = NULL;
+    }
+    g_ambient_glow = glow_make(GLOW_SIZE, 30.0 / 520.0, accent_rgb, 0.035, -1.0);
+    g_sidebar_glow = glow_make(GLOW_SIZE, 8.0 / 260.0, accent_rgb, 0.075, 0.018);
+    g_glow_accent = accent_rgb;
+}
+
+static void glow_paint(cairo_t *cr, cairo_surface_t *s,
+                       double cx, double cy, double radius)
+{
+    int size = cairo_image_surface_get_width(s);
+    double k = (2.0 * radius) / size;
+    cairo_save(cr);
+    cairo_translate(cr, cx - radius, cy - radius);
+    cairo_scale(cr, k, k);
+    cairo_set_source_surface(cr, s, 0.0, 0.0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+    cairo_paint(cr);
+    cairo_restore(cr);
+}
+
 static void paint_sidebar(cairo_t *cr, double now)
 {
     (void)now;
@@ -985,17 +1049,8 @@ static void paint_sidebar(cairo_t *cr, double now)
     cairo_rectangle(cr, 0, 0, SIDEBAR_W, WIN_H);
     cairo_fill(cr);
 
-    cairo_pattern_t *glow = cairo_pattern_create_radial(
-        36.0, 30.0, 8.0, 36.0, 30.0, 260.0);
-    cairo_pattern_add_color_stop_rgba(glow, 0.0,
-        R_(C_ACCENT), G_(C_ACCENT), B_(C_ACCENT), 0.075);
-    cairo_pattern_add_color_stop_rgba(glow, 0.55,
-        R_(C_ACCENT), G_(C_ACCENT), B_(C_ACCENT), 0.018);
-    cairo_pattern_add_color_stop_rgba(glow, 1.0,
-        R_(C_ACCENT), G_(C_ACCENT), B_(C_ACCENT), 0.0);
-    cairo_set_source(cr, glow);
-    cairo_paint(cr);
-    cairo_pattern_destroy(glow);
+    glow_ensure();
+    glow_paint(cr, g_sidebar_glow, 36.0, 30.0, 260.0);
 
     /* logo mark: four equaliser bars */
     rgba(cr, C_ACCENT, 0.14);
@@ -2135,16 +2190,9 @@ static void paint_content(cairo_t *cr)
     cairo_paint(cr);
     cairo_pattern_destroy(bg);
 
-    cairo_pattern_t *ambient = cairo_pattern_create_radial(
-        CONTENT_X + CONTENT_W * 0.62, 120.0, 30.0,
-        CONTENT_X + CONTENT_W * 0.62, 120.0, 520.0);
-    cairo_pattern_add_color_stop_rgba(ambient, 0.0,
-        R_(C_ACCENT), G_(C_ACCENT), B_(C_ACCENT), 0.035);
-    cairo_pattern_add_color_stop_rgba(ambient, 1.0,
-        R_(C_ACCENT), G_(C_ACCENT), B_(C_ACCENT), 0.0);
-    cairo_set_source(cr, ambient);
-    cairo_paint(cr);
-    cairo_pattern_destroy(ambient);
+    glow_ensure();
+    glow_paint(cr, g_ambient_glow,
+               CONTENT_X + CONTENT_W * 0.62, 120.0, 520.0);
 
     paint_sidebar(cr, g_ui.t);
     paint_header(cr);
@@ -2210,6 +2258,12 @@ struct App {
     uint32_t cursor_shape;
 
     int configured;
+    int dirty;
+
+    /* One outstanding wl_surface.frame callback.  Painting is paced by the
+     * compositor: we draw at most once per refresh and request no callbacks
+     * while the UI is idle. */
+    struct wl_callback *frame_cb;
 
     /* Window geometry remembered across runs.  Wayland leaves placement to
      * the compositor, so only size and maximized state are persisted. */
@@ -2231,7 +2285,6 @@ struct App {
 
     int quit;
     double t0;
-    double last_draw;
 
     int ctl_fd;
     int ctl_client_fd;
@@ -2452,6 +2505,26 @@ static ShmBuf *next_buffer(App *a, int w, int h)
     return NULL;
 }
 
+static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    (void)time;
+    App *a = data;
+    wl_callback_destroy(cb);
+    a->frame_cb = NULL;
+}
+
+static const struct wl_callback_listener frame_listener = {
+    .done = frame_done,
+};
+
+static void request_frame(App *a)
+{
+    if (!a->surface || a->frame_cb)
+        return;
+    a->frame_cb = wl_surface_frame(a->surface);
+    wl_callback_add_listener(a->frame_cb, &frame_listener, a);
+}
+
 static void app_draw(App *a)
 {
     if (!a->configured || !a->surface || !a->shm)
@@ -2490,6 +2563,7 @@ static void app_draw(App *a)
         wl_surface_set_buffer_scale(a->surface, a->scale);
     wl_surface_attach(a->surface, b->buffer, 0, 0);
     wl_surface_damage(a->surface, 0, 0, (int)WIN_W, (int)WIN_H);
+    request_frame(a);
     wl_surface_commit(a->surface);
     b->busy = 1;
 }
@@ -2556,6 +2630,7 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xs,
     App *a = data;
     xdg_surface_ack_configure(xs, serial);
     a->configured = 1;
+    a->dirty = 1;
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -2589,6 +2664,7 @@ static void toplevel_configure(void *data, struct xdg_toplevel *t,
             a->state_h = height;
         }
     }
+    a->dirty = 1;
 }
 
 static void toplevel_close(void *data, struct xdg_toplevel *t)
@@ -2809,6 +2885,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
     g_ui.pointer_y = wl_fixed_to_double(sy);
     g_ui.hover = hit_at(g_ui.pointer_x, g_ui.pointer_y);
     a->cursor_shape = 0;
+    a->dirty = 1;
     update_cursor(a);
 }
 
@@ -2821,6 +2898,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     g_ui.pointer_y = -1;
     g_ui.hover = -1;
     g_ui.pressed = -1;
+    a->dirty = 1;
     update_cursor(a);
 }
 
@@ -2837,6 +2915,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
         g_hits[g_ui.pressed].kind == HIT_SLIDER)
         slider_set_from_x(g_ui.pressed, g_ui.pointer_x);
 
+    a->dirty = 1;
     update_cursor(a);
 }
 
@@ -2877,6 +2956,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
         g_ui.pressed = -1;
         g_ui.hover = (kind == HIT_NAV) ? -1 : hit_at(x, y);
     }
+    a->dirty = 1;
     update_cursor(a);
 }
 
@@ -2980,6 +3060,7 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !a->xkb_state)
         return;
 
+    a->dirty = 1;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
 
     /* The Add application field owns the keyboard while it is open. */
@@ -3316,7 +3397,7 @@ static void ctl_handle_line(App *a, char *line)
         unsigned rgb;
         if (accent_parse(arg, &rgb)) {
             accent_set(rgb);
-                    a->last_draw = -1.0;
+            a->dirty = 1;
         }
         return;
     }
@@ -3331,7 +3412,7 @@ static void ctl_handle_line(App *a, char *line)
             g_ui.page = page;
             g_ui.hover = -1;
             g_ui.pressed = -1;
-            a->last_draw = -1.0;
+            a->dirty = 1;
         }
     }
 }
@@ -3472,6 +3553,12 @@ static int pump_events(App *a, int timeout_ms)
     if (wl_display_dispatch_pending(a->display) < 0)
         return -1;
 
+    /* Dispatching may have applied a configure that marked us dirty.  When
+     * the caller asked to block indefinitely, return immediately so the
+     * resize repaint is not held until some unrelated event arrives. */
+    if (timeout_ms < 0 && a->dirty)
+        return 0;
+
     int want_write = 0;
     if (wl_display_flush(a->display) < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK)
@@ -3537,6 +3624,10 @@ static void app_cleanup(App *a)
 {
     ctl_cleanup(a);
 
+    if (a->frame_cb) {
+        wl_callback_destroy(a->frame_cb);
+        a->frame_cb = NULL;
+    }
     if (a->keyboard)
         wl_keyboard_destroy(a->keyboard);
     if (a->cursor_shape_device) {
@@ -3696,7 +3787,6 @@ int main(int argc, char **argv)
     a.scale = 1;
     a.ctl_fd = -1;
     a.ctl_client_fd = -1;
-    a.last_draw = -1.0;
     state_load(&a);
     a.xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
@@ -3719,12 +3809,28 @@ int main(int argc, char **argv)
         double now = mono_sec();
         g_ui.t = now - a.t0;
 
-        if (a.configured && now - a.last_draw >= 1.0 / 30.0) {
-            app_draw(&a);
-            a.last_draw = now;
+        int animating = g_ui.startup_adding;
+        if (!animating && g_ui.toast[0]) {
+            double age = now - g_ui.toast_t;
+            if (age >= 0.0 && age < 3.0)
+                animating = 1;
         }
 
-        int timeout = a.configured ? 33 : 100;
+        if (a.configured && (a.dirty || animating) && !a.frame_cb) {
+            app_draw(&a);
+            a.dirty = 0;
+        }
+
+        /* A pending frame callback wakes us at the next refresh.  While
+         * animating we still cap the wait so a stalled compositor cannot
+         * freeze the UI; when truly idle we block until input or a control
+         * command arrives. */
+        int timeout;
+        if (!a.configured || animating || a.dirty)
+            timeout = 100;
+        else
+            timeout = -1;
+
         if (pump_events(&a, timeout) < 0)
             break;
     }
