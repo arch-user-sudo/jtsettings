@@ -6,6 +6,7 @@ LDLIBS = $(shell pkg-config --libs $(PKGS)) -lm
 
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
+ICONDIR := $(PREFIX)/share/icons/hicolor
 
 WAYLAND_PROTOCOLS := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 XDG_SHELL_XML := $(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml
@@ -69,12 +70,24 @@ install: jtsettings jtsettingsctl jtstartup
 	install -Dm755 jtsettings $(DESTDIR)$(BINDIR)/jtsettings
 	install -Dm755 jtsettingsctl $(DESTDIR)$(BINDIR)/jtsettingsctl
 	install -Dm755 jtstartup $(DESTDIR)$(BINDIR)/jtstartup
+	install -Dm644 icons/jtsettings.svg \
+		$(DESTDIR)$(ICONDIR)/scalable/apps/jtsettings.svg
+	install -Dm644 icons/jtsettings.png \
+		$(DESTDIR)$(ICONDIR)/256x256/apps/jtsettings.png
+	@if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+		gtk-update-icon-cache -f -t $(DESTDIR)$(ICONDIR) >/dev/null 2>&1 || true; \
+	fi
 	@echo "installed to $(DESTDIR)$(PREFIX)"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/jtsettings
 	rm -f $(DESTDIR)$(BINDIR)/jtsettingsctl
 	rm -f $(DESTDIR)$(BINDIR)/jtstartup
+	rm -f $(DESTDIR)$(ICONDIR)/scalable/apps/jtsettings.svg
+	rm -f $(DESTDIR)$(ICONDIR)/256x256/apps/jtsettings.png
+	@if command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+		gtk-update-icon-cache -f -t $(DESTDIR)$(ICONDIR) >/dev/null 2>&1 || true; \
+	fi
 
 preview: jtsettings
 	./jtsettings --screenshot preview.png
