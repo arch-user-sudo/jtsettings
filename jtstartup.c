@@ -7,11 +7,12 @@
  *   # jtsettings autostart configuration
  *   delay_ms=4000
  *   run jtlab
- *   run foot --server
+ *   off foot --server
  *
  * jtstartup waits delay_ms, then starts every `run` command detached from the
- * session through /bin/sh.  Missing files, blank lines and # comments are
- * ignored, so running it without a saved configuration is harmless.
+ * session through /bin/sh.  `off` entries are listed by jtsettings but skipped
+ * here.  Missing files, blank lines and # comments are ignored, so running it
+ * without a saved configuration is harmless.
  *
  *   jtstartup
  *   jtstartup --dry-run

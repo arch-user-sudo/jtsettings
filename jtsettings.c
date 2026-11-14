@@ -449,7 +449,8 @@ enum {
     HIT_SLIDER,
     HIT_SEGMENT,
     HIT_ROW,
-    HIT_BUTTON
+    HIT_BUTTON,
+    HIT_START_TOGGLE
 };
 
 enum {
@@ -1261,6 +1262,7 @@ static void page_keybindings(cairo_t *cr)
 
 typedef struct {
     char command[STARTUP_CMD_MAX];
+    int enabled;
 } StartupEntry;
 
 static StartupEntry g_startups[STARTUP_MAX];
@@ -1352,7 +1354,8 @@ startup_save(void)
                      STARTUP_DELAY_SCALE);
     fprintf(f, "delay_ms=%ld\n", ms);
     for (int i = 0; i < g_startup_count; i++)
-        fprintf(f, "run %s\n", g_startups[i].command);
+        fprintf(f, "%s %s\n", g_startups[i].enabled ? "run" : "off",
+                g_startups[i].command);
     fclose(f);
 }
 
@@ -1385,11 +1388,23 @@ startup_load(void)
             continue;
         }
 
-        if (strncmp(s, "run ", 4) != 0) continue;
-        char *cmd = startup_trim(s + 4);
+        int enabled;
+        const char *rest;
+        if (!strncmp(s, "run ", 4)) {
+            enabled = 1;
+            rest = s + 4;
+        } else if (!strncmp(s, "off ", 4)) {
+            enabled = 0;
+            rest = s + 4;
+        } else {
+            continue;
+        }
+
+        char *cmd = startup_trim((char *)rest);
         if (!*cmd || g_startup_count >= STARTUP_MAX) continue;
         snprintf(g_startups[g_startup_count].command, STARTUP_CMD_MAX,
                  "%s", cmd);
+        g_startups[g_startup_count].enabled = enabled;
         g_startup_count++;
     }
     fclose(f);
@@ -1403,6 +1418,7 @@ startup_add(const char *cmd)
         return;
     snprintf(g_startups[g_startup_count].command, STARTUP_CMD_MAX,
              "%s", cmd);
+    g_startups[g_startup_count].enabled = 1;
     g_startup_count++;
     startup_save();
 }
@@ -1450,11 +1466,11 @@ static void paint_app_icon(cairo_t *cr, double x, double y, double size,
               x + size / 2.0, y + (size - 15.0) / 2.0, ALIGN_CENTER, 0.0);
 }
 
-static void paint_mini_toggle(cairo_t *cr, double x, double y,
-                              int on, int toggle_id)
+static void paint_switch(cairo_t *cr, double x, double y, int on,
+                         int kind, int id)
 {
     double tw = 38.0, th = 20.0;
-    int idx = add_hit(HIT_TOGGLE, toggle_id, 0, x - 4.0, y - 4.0,
+    int idx = add_hit(kind, id, 0, x - 4.0, y - 4.0,
                       tw + 8.0, th + 8.0);
     int hot = hit_hover(idx);
 
@@ -1474,6 +1490,12 @@ static void paint_mini_toggle(cairo_t *cr, double x, double y,
     cairo_fill(cr);
 }
 
+static void paint_mini_toggle(cairo_t *cr, double x, double y,
+                              int on, int toggle_id)
+{
+    paint_switch(cr, x, y, on, HIT_TOGGLE, toggle_id);
+}
+
 static void page_startup(cairo_t *cr)
 {
     section_label(cr, "AUTOSTART", CONTENT_X, 102.0);
@@ -1485,7 +1507,7 @@ static void page_startup(cairo_t *cr)
 
     text_draw(cr, "APPLICATION", 8.0, 600, C_FAINT, 0.9,
               tx + 20.0, ty + 14.0, ALIGN_LEFT, 1.4);
-    text_draw(cr, "REMOVE", 8.0, 600, C_FAINT, 0.9,
+    text_draw(cr, "ENABLED", 8.0, 600, C_FAINT, 0.9,
               tx + tw - 20.0, ty + 14.0, ALIGN_RIGHT, 1.4);
     paint_divider(cr, tx + 20.0, ty + 34.0, tw - 40.0);
 
@@ -1510,8 +1532,11 @@ static void page_startup(cairo_t *cr)
         text_draw(cr, g_startups[i].command, 8.5, 400, C_DIM, 0.75,
                   tx + 62.0, ry + 22.0, ALIGN_LEFT, 0.1);
 
-        paint_button(cr, tx + tw - 92.0, ry + 9.0, 72.0, 26.0,
+        paint_button(cr, tx + tw - 136.0, ry + 9.0, 66.0, 26.0,
                      "Remove", 0, BTN_START_REMOVE_FIRST + i);
+
+        paint_switch(cr, tx + tw - 58.0, ry + 12.0,
+                     g_startups[i].enabled, HIT_START_TOGGLE, i);
 
         if (i < g_startup_count - 1)
             paint_divider(cr, tx + 20.0, ry + 43.0, tw - 40.0);
@@ -2541,6 +2566,15 @@ static void ui_activate(App *a, int idx)
     case HIT_TOGGLE:
         if (h->a >= 0 && h->a < TOG_COUNT)
             g_ui.toggles[h->a] = !g_ui.toggles[h->a];
+        break;
+    case HIT_START_TOGGLE:
+        if (h->a >= 0 && h->a < g_startup_count) {
+            g_startups[h->a].enabled = !g_startups[h->a].enabled;
+            startup_save();
+            ui_toast(g_startups[h->a].enabled
+                     ? "Startup application enabled"
+                     : "Startup application disabled");
+        }
         break;
     case HIT_SEGMENT:
         if (h->a >= 0 && h->a < SEG_COUNT)
