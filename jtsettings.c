@@ -8,11 +8,14 @@
  *   ./jtsettings '#378484'          (optional accent override)
  *   ./jtsettings --page startup     (open a particular page)
  *   ./jtsettingsctl accent '#378484'
+ *   ./jtstartup                    (run the saved startup apps)
  *
- * This is a GUI preview.  Every control is drawn and reacts locally, but
- * nothing is written to jtlabwc's configuration yet.  The left panel mirrors
- * the areas a real settings app would cover: keybindings, startup apps,
- * window rules, input, displays, session behaviour and an about page.
+ * Most of this is a GUI preview: controls are drawn and react locally, but
+ * only the Startup Apps page writes a file.  It saves the enabled entries and
+ * launch delay to ~/.config/jt/startup.conf, which jtstartup reads at session
+ * start.  Everything else stays local.  The left panel mirrors the areas a
+ * real settings app would cover: keybindings, startup apps, window rules,
+ * input, displays, session behaviour and an about page.
  *
  * The palette and typography follow ~/JTLab/config.h: #030303 background,
  * #404040 borders, #E8A03C amber accent by default, #66B366 success green,
@@ -34,6 +37,7 @@
 #include "xdg-toplevel-icon-client-protocol.h"
 #include "cursor-shape-client-protocol.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -65,6 +69,11 @@
 #define CONTENT_W (WIN_W - CONTENT_X - 36.0)
 
 #define FONT_FAMILY "Liberation"
+
+/* Startup Apps page.  The list is loaded from ~/.config/jt/startup.conf;
+ * there are no built-in entries, so a fresh install starts empty. */
+#define STARTUP_MAX     8
+#define STARTUP_CMD_MAX 512
 
 #define C_BG        0x030303
 #define C_BG_TOP    0x070708
@@ -399,12 +408,6 @@ enum {
     TOG_DRAG,
     TOG_DWT,
     TOG_LEFT,
-    TOG_APP_JTLAB,
-    TOG_APP_FOOT,
-    TOG_APP_WALL,
-    TOG_APP_NOTIFY,
-    TOG_APP_CLIP,
-    TOG_APP_KEYRING,
     TOG_RULE_PIP,
     TOG_RULE_TERM,
     TOG_RULE_WEB,
@@ -451,13 +454,14 @@ enum {
 
 enum {
     BTN_ADD_BINDING,
-    BTN_ADD_START,
     BTN_NEW_RULE,
     BTN_DOCS,
     BTN_UPDATE,
     BTN_LOGOUT,
     BTN_REBOOT,
-    BTN_SHUTDOWN
+    BTN_SHUTDOWN,
+    BTN_START_ADD,
+    BTN_START_REMOVE_FIRST   /* + row index */
 };
 
 typedef struct {
@@ -480,11 +484,17 @@ typedef struct {
     int hover;
     int pressed;
     double pointer_x, pointer_y;
+    int startup_adding;
+    char startup_input[STARTUP_CMD_MAX];
     char toast[96];
     double toast_t;
 } Ui;
 
 static Ui g_ui;
+
+/* Defined below, once the startup list is in scope. */
+static int startup_load(void);
+static void startup_save(void);
 
 static void ui_toast(const char *msg)
 {
@@ -507,12 +517,6 @@ static void ui_init(void)
     g_ui.toggles[TOG_DRAG] = 1;
     g_ui.toggles[TOG_DWT] = 1;
     g_ui.toggles[TOG_LEFT] = 0;
-    g_ui.toggles[TOG_APP_JTLAB] = 1;
-    g_ui.toggles[TOG_APP_FOOT] = 1;
-    g_ui.toggles[TOG_APP_WALL] = 1;
-    g_ui.toggles[TOG_APP_NOTIFY] = 1;
-    g_ui.toggles[TOG_APP_CLIP] = 0;
-    g_ui.toggles[TOG_APP_KEYRING] = 1;
     g_ui.toggles[TOG_RULE_PIP] = 1;
     g_ui.toggles[TOG_RULE_TERM] = 1;
     g_ui.toggles[TOG_RULE_WEB] = 0;
@@ -541,6 +545,11 @@ static void ui_init(void)
 
     for (int i = 0; i < PAGE_COUNT; i++)
         g_ui.selected[i] = 0;
+
+    /* A saved autostart configuration overrides the defaults above.  With no
+     * file, every startup entry starts disabled rather than showing preview
+     * defaults; enabling one writes the file. */
+    (void)startup_load();
 }
 
 static int add_hit(int kind, int a, int b,
@@ -1102,7 +1111,9 @@ static void paint_footer(cairo_t *cr)
     paint_divider(cr, SIDEBAR_W, 690.0, WIN_W - SIDEBAR_W);
 
     double age = mono_sec() - g_ui.toast_t;
-    const char *msg = "PREVIEW · changes are not saved";
+    const char *msg = g_ui.page == PAGE_STARTUP
+        ? "AUTOSTART · ~/.config/jt/startup.conf"
+        : "PREVIEW · changes are not saved";
     unsigned col = C_FAINT;
     double alpha = 0.9;
 
@@ -1249,28 +1260,179 @@ static void page_keybindings(cairo_t *cr)
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    const char *name;
-    const char *command;
-    const char *note;
-    unsigned tint;
-    int toggle;
-} StartupRow;
+    char command[STARTUP_CMD_MAX];
+} StartupEntry;
 
-static const StartupRow STARTUPS[] = {
-    { "JTLab", "jtlab", "Desktop bar, popups and taskbar", 0xE8A03C,
-      TOG_APP_JTLAB },
-    { "foot server", "foot --server", "Shared terminal daemon", 0x36B4EB,
-      TOG_APP_FOOT },
-    { "jtwallpaperd", "jtwallpaperd --daemon", "Wallpaper and accent source",
-      0x66B366, TOG_APP_WALL },
-    { "jtnotify", "jtnotify --daemon", "Notification centre", 0xB07CE6,
-      TOG_APP_NOTIFY },
-    { "wl-clipboard", "wl-paste --watch cliphist store",
-      "Clipboard history", 0xE06C9F, TOG_APP_CLIP },
-    { "gnome-keyring", "gnome-keyring-daemon --start", "Secret storage",
-      0xC9B458, TOG_APP_KEYRING },
-};
-#define STARTUP_COUNT ((int)(sizeof STARTUPS / sizeof STARTUPS[0]))
+static StartupEntry g_startups[STARTUP_MAX];
+static int g_startup_count;
+
+/* ------------------------------------------------------------------ */
+/*  Autostart configuration                                            */
+/* ------------------------------------------------------------------ */
+
+#define STARTUP_DIR       "jt"
+#define STARTUP_FILE      "startup.conf"
+#define STARTUP_PATH_MAX  512
+#define STARTUP_DELAY_MAX 60000L
+#define STARTUP_DELAY_SCALE 20000.0   /* slider 1.0 == 20 s */
+
+/* Keep this path and the file format in sync with jtstartup.c. */
+static void
+startup_config_path(char *buf, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(buf, n, "%s/.config/%s/%s", home, STARTUP_DIR, STARTUP_FILE);
+}
+
+static void
+startup_mkdirs(const char *path)
+{
+    char dir[STARTUP_PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (!slash || slash == dir) return;
+    *slash = '\0';
+
+    for (char *p = dir + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        (void)mkdir(dir, 0700);
+        *p = '/';
+    }
+    (void)mkdir(dir, 0700);
+}
+
+static char *
+startup_trim(char *s)
+{
+    while (*s && isspace((unsigned char)*s)) s++;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) end--;
+    *end = '\0';
+    return s;
+}
+
+/* Human-friendly label: the basename of the first word in the command. */
+static void
+startup_name(const char *cmd, char *buf, size_t n)
+{
+    const char *start = cmd;
+    while (*start && isspace((unsigned char)*start)) start++;
+    const char *end = start;
+    while (*end && !isspace((unsigned char)*end)) end++;
+
+    const char *base = start;
+    for (const char *p = start; p < end; p++)
+        if (*p == '/') base = p + 1;
+
+    size_t len = (size_t)(end - base);
+    if (len == 0) {
+        snprintf(buf, n, "Application");
+        return;
+    }
+    if (len >= n) len = n - 1;
+    memcpy(buf, base, len);
+    buf[len] = '\0';
+}
+
+static void
+startup_save(void)
+{
+    char path[STARTUP_PATH_MAX];
+    startup_config_path(path, sizeof path);
+    startup_mkdirs(path);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "# jtsettings autostart configuration\n");
+    fprintf(f, "# Written by jtsettings, read by jtstartup.\n");
+    long ms = lround(clampd(g_ui.sliders[SL_START_DELAY], 0.0, 1.0) *
+                     STARTUP_DELAY_SCALE);
+    fprintf(f, "delay_ms=%ld\n", ms);
+    for (int i = 0; i < g_startup_count; i++)
+        fprintf(f, "run %s\n", g_startups[i].command);
+    fclose(f);
+}
+
+static int
+startup_load(void)
+{
+    char path[STARTUP_PATH_MAX];
+    startup_config_path(path, sizeof path);
+
+    /* The file is the complete list.  No file means an empty list, not a set
+     * of preview defaults. */
+    g_startup_count = 0;
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *s = startup_trim(line);
+        if (!*s || *s == '#') continue;
+
+        if (!strncmp(s, "delay_ms=", 9)) {
+            char *end = NULL;
+            long ms = strtol(s + 9, &end, 10);
+            if (end != s + 9 && ms >= 0) {
+                if (ms > STARTUP_DELAY_MAX) ms = STARTUP_DELAY_MAX;
+                g_ui.sliders[SL_START_DELAY] =
+                    clampd((double)ms / STARTUP_DELAY_SCALE, 0.0, 1.0);
+            }
+            continue;
+        }
+
+        if (strncmp(s, "run ", 4) != 0) continue;
+        char *cmd = startup_trim(s + 4);
+        if (!*cmd || g_startup_count >= STARTUP_MAX) continue;
+        snprintf(g_startups[g_startup_count].command, STARTUP_CMD_MAX,
+                 "%s", cmd);
+        g_startup_count++;
+    }
+    fclose(f);
+    return 1;
+}
+
+static void
+startup_add(const char *cmd)
+{
+    if (g_startup_count >= STARTUP_MAX)
+        return;
+    snprintf(g_startups[g_startup_count].command, STARTUP_CMD_MAX,
+             "%s", cmd);
+    g_startup_count++;
+    startup_save();
+}
+
+static void
+startup_remove(int index)
+{
+    if (index < 0 || index >= g_startup_count)
+        return;
+    for (int i = index; i + 1 < g_startup_count; i++)
+        g_startups[i] = g_startups[i + 1];
+    g_startup_count--;
+    startup_save();
+}
+
+static void
+startup_input_cancel(void)
+{
+    g_ui.startup_adding = 0;
+    g_ui.startup_input[0] = '\0';
+}
+
+static void
+startup_input_commit(void)
+{
+    char *cmd = startup_trim(g_ui.startup_input);
+    if (*cmd)
+        startup_add(cmd);
+    startup_input_cancel();
+}
 
 static void paint_app_icon(cairo_t *cr, double x, double y, double size,
                            const char *label, unsigned tint)
@@ -1318,65 +1480,100 @@ static void page_startup(cairo_t *cr)
     text_draw(cr, "Applications launched when the jtlabwc session starts",
               9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
 
-    double tx = CONTENT_X, ty = 142.0, tw = CONTENT_W, th = 416.0;
+    double tx = CONTENT_X, ty = 142.0, tw = CONTENT_W, th = 444.0;
     paint_card(cr, tx, ty, tw, th);
 
     text_draw(cr, "APPLICATION", 8.0, 600, C_FAINT, 0.9,
               tx + 20.0, ty + 14.0, ALIGN_LEFT, 1.4);
-    text_draw(cr, "COMMAND", 8.0, 600, C_FAINT, 0.9,
-              tx + 300.0, ty + 14.0, ALIGN_LEFT, 1.4);
-    text_draw(cr, "ENABLED", 8.0, 600, C_FAINT, 0.9,
-              tx + tw - 24.0, ty + 14.0, ALIGN_RIGHT, 1.4);
+    text_draw(cr, "REMOVE", 8.0, 600, C_FAINT, 0.9,
+              tx + tw - 20.0, ty + 14.0, ALIGN_RIGHT, 1.4);
     paint_divider(cr, tx + 20.0, ty + 34.0, tw - 40.0);
 
-    for (int i = 0; i < STARTUP_COUNT; i++) {
-        double ry = ty + 42.0 + i * 61.0;
-        int idx = add_hit(HIT_ROW, i, 0, tx + 8.0, ry, tw - 16.0, 58.0);
-        int sel = g_ui.selected[PAGE_STARTUP] == i;
-        int hot = hit_hover(idx);
-
-        if (sel || hot) {
-            rgba(cr, sel ? C_ACCENT : C_FG, sel ? 0.070 : 0.030);
-            rounded_rect(cr, tx + 8.0, ry, tw - 16.0, 56.0, 7.0);
-            cairo_fill(cr);
-        }
-        if (sel) {
-            rgba(cr, C_ACCENT, 0.9);
-            rounded_rect(cr, tx + 8.0, ry + 15.0, 3.0, 26.0, 1.5);
-            cairo_fill(cr);
-        }
-
-        paint_app_icon(cr, tx + 24.0, ry + 12.0, 32.0,
-                       STARTUPS[i].name, STARTUPS[i].tint);
-
-        text_draw(cr, STARTUPS[i].name, 11.5, 600, C_FG, 0.95,
-                  tx + 68.0, ry + 11.0, ALIGN_LEFT, 0.1);
-        text_draw(cr, STARTUPS[i].note, 8.5, 400, C_DIM, 0.72,
-                  tx + 68.0, ry + 29.0, ALIGN_LEFT, 0.1);
-        text_draw(cr, STARTUPS[i].command, 9.0, 500, C_DIM, 0.85,
-                  tx + 300.0, ry + 20.0, ALIGN_LEFT, 0.15);
-
-        paint_mini_toggle(cr, tx + tw - 62.0, ry + 18.0,
-                          g_ui.toggles[STARTUPS[i].toggle],
-                          STARTUPS[i].toggle);
-
-        if (i < STARTUP_COUNT - 1)
-            paint_divider(cr, tx + 20.0, ry + 59.0, tw - 40.0);
+    if (g_startup_count == 0) {
+        text_draw(cr, "No startup applications", 14.0, 600, C_FG, 0.9,
+                  tx + tw / 2.0, ty + 168.0, ALIGN_CENTER, 0.15);
+        text_draw(cr,
+                  "Add an application and it will launch with your session.",
+                  9.5, 400, C_DIM, 0.72, tx + tw / 2.0, ty + 194.0,
+                  ALIGN_CENTER, 0.1);
     }
 
-    double by = 580.0, bh = 84.0;
+    for (int i = 0; i < g_startup_count; i++) {
+        double ry = ty + 42.0 + i * 44.0;
+        char name[64];
+        startup_name(g_startups[i].command, name, sizeof name);
+
+        paint_app_icon(cr, tx + 22.0, ry + 7.0, 28.0, name, C_ACCENT);
+
+        text_draw(cr, name, 11.0, 600, C_FG, 0.95,
+                  tx + 62.0, ry + 4.0, ALIGN_LEFT, 0.1);
+        text_draw(cr, g_startups[i].command, 8.5, 400, C_DIM, 0.75,
+                  tx + 62.0, ry + 22.0, ALIGN_LEFT, 0.1);
+
+        paint_button(cr, tx + tw - 92.0, ry + 9.0, 72.0, 26.0,
+                     "Remove", 0, BTN_START_REMOVE_FIRST + i);
+
+        if (i < g_startup_count - 1)
+            paint_divider(cr, tx + 20.0, ry + 43.0, tw - 40.0);
+    }
+
+    double ay = ty + th - 40.0;
+    if (g_ui.startup_adding) {
+        double fx = tx + 20.0, fw = tw - 40.0, fh = 32.0;
+        rgba(cr, C_TRACK, 0.95);
+        rounded_rect(cr, fx, ay, fw, fh, 7.0);
+        cairo_fill(cr);
+        rgba(cr, C_ACCENT, 0.80);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, fx + 0.5, ay + 0.5, fw - 1.0, fh - 1.0, 6.5);
+        cairo_stroke(cr);
+
+        const char *input = g_ui.startup_input;
+        if (*input) {
+            text_draw(cr, input, 10.5, 500, C_FG, 0.95,
+                      fx + 12.0, ay + 9.0, ALIGN_LEFT, 0.1);
+        } else {
+            text_draw(cr, "Type a command, e.g. foot --server",
+                      10.5, 500, C_FAINT, 0.85,
+                      fx + 12.0, ay + 9.0, ALIGN_LEFT, 0.1);
+        }
+
+        if ((int)(g_ui.t * 2.0) % 2 == 0) {
+            double cx = fx + 12.0 +
+                text_width(cr, input, 10.5, 500, 0.1) + 2.0;
+            rgba(cr, C_ACCENT, 0.9);
+            cairo_set_line_width(cr, 1.2);
+            cairo_move_to(cr, cx, ay + 8.0);
+            cairo_line_to(cr, cx, ay + 24.0);
+            cairo_stroke(cr);
+        }
+
+        text_draw(cr, "Enter to add · Esc to cancel", 8.5, 500,
+                  C_FAINT, 0.8, fx + fw - 12.0, ay + 10.0,
+                  ALIGN_RIGHT, 0.2);
+    } else {
+        paint_dashed_button(cr, tx + 20.0, ay, tw - 40.0, 32.0,
+                            "Add application", BTN_START_ADD);
+    }
+
+    double by = 598.0, bh = 72.0;
     paint_card(cr, CONTENT_X, by, 368.0, bh);
     char v[32];
-    paint_slider_row(cr, CONTENT_X + 18.0, by + 14.0, 332.0,
+    paint_slider_row(cr, CONTENT_X + 18.0, by + 12.0, 332.0,
                      "Launch delay",
                      slider_text(SL_START_DELAY,
                                  g_ui.sliders[SL_START_DELAY], v, sizeof v),
                      g_ui.sliders[SL_START_DELAY], SL_START_DELAY);
     text_draw(cr, "Wait before the first application starts", 8.5, 400,
-              C_FAINT, 0.8, CONTENT_X + 18.0, by + 56.0, ALIGN_LEFT, 0.1);
+              C_FAINT, 0.8, CONTENT_X + 18.0, by + 50.0, ALIGN_LEFT, 0.1);
 
-    paint_dashed_button(cr, CONTENT_X + 388.0, by + 18.0, 368.0, 48.0,
-                        "Add application", BTN_ADD_START);
+    paint_card(cr, CONTENT_X + 388.0, by, 368.0, bh);
+    text_draw(cr, "AUTOSTART FILE", 8.0, 600, C_FAINT, 0.9,
+              CONTENT_X + 406.0, by + 14.0, ALIGN_LEFT, 1.4);
+    text_draw(cr, "~/.config/jt/startup.conf", 10.0, 500, C_ACCENT, 0.95,
+              CONTENT_X + 406.0, by + 32.0, ALIGN_LEFT, 0.2);
+    text_draw(cr, "Changes are written immediately", 8.5, 400, C_DIM, 0.75,
+              CONTENT_X + 406.0, by + 50.0, ALIGN_LEFT, 0.1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2354,12 +2551,24 @@ static void ui_activate(App *a, int idx)
             g_ui.selected[g_ui.page] = h->a;
         break;
     case HIT_BUTTON:
+        if (h->a == BTN_START_ADD) {
+            if (g_startup_count >= STARTUP_MAX) {
+                ui_toast("Startup list is full");
+            } else {
+                g_ui.startup_adding = 1;
+                g_ui.startup_input[0] = '\0';
+            }
+            break;
+        }
+        if (h->a >= BTN_START_REMOVE_FIRST &&
+            h->a < BTN_START_REMOVE_FIRST + g_startup_count) {
+            startup_remove(h->a - BTN_START_REMOVE_FIRST);
+            ui_toast("Startup application removed");
+            break;
+        }
         switch (h->a) {
         case BTN_ADD_BINDING:
             ui_toast("Preview only — keybindings are not saved");
-            break;
-        case BTN_ADD_START:
-            ui_toast("Preview only — autostart is not changed");
             break;
         case BTN_NEW_RULE:
             ui_toast("Preview only — window rules are not saved");
@@ -2466,8 +2675,17 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
             slider_set_from_x(idx, x);
     } else {
         int kind = (idx >= 0) ? g_hits[idx].kind : HIT_NONE;
-        if (idx >= 0 && idx == g_ui.pressed && kind != HIT_SLIDER)
+        int pressed = g_ui.pressed;
+        if (idx >= 0 && idx == pressed && kind != HIT_SLIDER)
             ui_activate(a, idx);
+        /* Persist the autostart delay once the drag ends rather than on
+         * every motion event. */
+        if (pressed >= 0 && pressed < g_hit_count &&
+            g_hits[pressed].kind == HIT_SLIDER &&
+            g_hits[pressed].a == SL_START_DELAY) {
+            startup_save();
+            ui_toast("Autostart delay saved");
+        }
         g_ui.pressed = -1;
         g_ui.hover = (kind == HIT_NAV) ? -1 : hit_at(x, y);
     }
@@ -2575,6 +2793,44 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
         return;
 
     xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
+
+    /* The Add application field owns the keyboard while it is open. */
+    if (g_ui.page == PAGE_STARTUP && g_ui.startup_adding) {
+        if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+            startup_input_commit();
+            return;
+        }
+        if (sym == XKB_KEY_Escape) {
+            startup_input_cancel();
+            return;
+        }
+        if (sym == XKB_KEY_BackSpace) {
+            size_t len = strlen(g_ui.startup_input);
+            if (len > 0)
+                g_ui.startup_input[len - 1] = '\0';
+            return;
+        }
+        if (sym == XKB_KEY_Delete) {
+            g_ui.startup_input[0] = '\0';
+            return;
+        }
+
+        char buf[16];
+        int n = xkb_state_key_get_utf8(a->xkb_state, key + 8,
+                                       buf, sizeof buf);
+        if (n > 0) {
+            size_t len = strlen(g_ui.startup_input);
+            for (int i = 0; i < n; i++) {
+                unsigned char c = (unsigned char)buf[i];
+                if (c < 0x20 || c == 0x7F)
+                    continue;
+                if (len + 1 < sizeof g_ui.startup_input)
+                    g_ui.startup_input[len++] = (char)c;
+            }
+            g_ui.startup_input[len] = '\0';
+        }
+        return;
+    }
 
     if (sym == XKB_KEY_Escape || sym == XKB_KEY_q || sym == XKB_KEY_x) {
         a->quit = 1;

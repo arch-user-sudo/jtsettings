@@ -20,7 +20,7 @@ GEN = xdg-shell-client-protocol.h xdg-shell-protocol.c \
       cursor-shape-client-protocol.h cursor-shape-protocol.c \
       tablet-client-protocol.h tablet-protocol.c
 
-all: jtsettings jtsettingsctl
+all: jtsettings jtsettingsctl jtstartup
 
 jtsettings: jtsettings.c $(GEN)
 	$(CC) $(CFLAGS) -o $@ jtsettings.c \
@@ -30,6 +30,9 @@ jtsettings: jtsettings.c $(GEN)
 		$(LDFLAGS) $(LDLIBS)
 
 jtsettingsctl: jtsettingsctl.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
+
+jtstartup: jtstartup.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 xdg-shell-client-protocol.h: $(XDG_SHELL_XML)
@@ -62,19 +65,21 @@ tablet-client-protocol.h: $(TABLET_XML)
 tablet-protocol.c: $(TABLET_XML)
 	wayland-scanner private-code $< $@
 
-install: jtsettings jtsettingsctl
+install: jtsettings jtsettingsctl jtstartup
 	install -Dm755 jtsettings $(DESTDIR)$(BINDIR)/jtsettings
 	install -Dm755 jtsettingsctl $(DESTDIR)$(BINDIR)/jtsettingsctl
+	install -Dm755 jtstartup $(DESTDIR)$(BINDIR)/jtstartup
 	@echo "installed to $(DESTDIR)$(PREFIX)"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/jtsettings
 	rm -f $(DESTDIR)$(BINDIR)/jtsettingsctl
+	rm -f $(DESTDIR)$(BINDIR)/jtstartup
 
 preview: jtsettings
 	./jtsettings --screenshot preview.png
 
 clean:
-	rm -f jtsettings jtsettingsctl preview.png $(GEN)
+	rm -f jtsettings jtsettingsctl jtstartup preview.png $(GEN)
 
 .PHONY: all install uninstall preview clean
