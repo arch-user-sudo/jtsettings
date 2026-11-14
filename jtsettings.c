@@ -533,7 +533,7 @@ static void ui_init(void)
     g_ui.sliders[SL_POINTER] = 0.52;
     g_ui.sliders[SL_REPEAT] = 0.58;
     g_ui.sliders[SL_DELAY] = 0.35;
-    g_ui.sliders[SL_START_DELAY] = 0.20;
+    g_ui.sliders[SL_START_DELAY] = 0.0;
     g_ui.sliders[SL_IDLE] = 0.45;
 
     g_ui.segments[SEG_SCROLL] = 0;
