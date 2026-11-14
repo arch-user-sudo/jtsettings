@@ -59,8 +59,10 @@
 /*  Look & feel                                                        */
 /* ------------------------------------------------------------------ */
 
-#define WIN_W 1080.0
-#define WIN_H 720.0
+#define DESIGN_W 1080.0
+#define DESIGN_H 720.0
+static double WIN_W = DESIGN_W;
+static double WIN_H = DESIGN_H;
 
 #define SIDEBAR_W 252.0
 #define HEADER_H  84.0
@@ -1047,23 +1049,23 @@ static void paint_sidebar(cairo_t *cr, double now)
         y += 41.0;
     }
 
-    paint_divider(cr, 22.0, 592.0, SIDEBAR_W - 44.0);
+    paint_divider(cr, 22.0, WIN_H - 128.0, SIDEBAR_W - 44.0);
 
     text_draw(cr, "PREVIEW BUILD", 8.0, 600, C_FAINT, 0.9,
-              24.0, 610.0, ALIGN_LEFT, 1.7);
+              24.0, WIN_H - 110.0, ALIGN_LEFT, 1.7);
     text_draw(cr, "jtsettings 0.1.0", 10.5, 600, 0xD6D6D6, 0.92,
-              24.0, 628.0, ALIGN_LEFT, 0.1);
+              24.0, WIN_H - 92.0, ALIGN_LEFT, 0.1);
 
     rgba(cr, C_ACCENT, 0.95);
-    cairo_arc(cr, 29.0, 658.0, 4.0, 0.0, 2.0 * PI);
+    cairo_arc(cr, 29.0, WIN_H - 62.0, 4.0, 0.0, 2.0 * PI);
     cairo_fill(cr);
     char hex[16];
     snprintf(hex, sizeof hex, "#%06X", C_ACCENT);
     text_draw(cr, hex, 9.5, 500, C_DIM, 0.9,
-              40.0, 652.0, ALIGN_LEFT, 0.6);
+              40.0, WIN_H - 68.0, ALIGN_LEFT, 0.6);
 
     text_draw(cr, "↑ ↓  switch pages", 8.5, 400, C_FAINT, 0.8,
-              24.0, 678.0, ALIGN_LEFT, 0.2);
+              24.0, WIN_H - 42.0, ALIGN_LEFT, 0.2);
 
     rgba(cr, C_BORDER, 0.35);
     cairo_set_line_width(cr, 1.0);
@@ -1109,7 +1111,7 @@ static void paint_header(cairo_t *cr)
 
 static void paint_footer(cairo_t *cr)
 {
-    paint_divider(cr, SIDEBAR_W, 690.0, WIN_W - SIDEBAR_W);
+    paint_divider(cr, SIDEBAR_W, WIN_H - 30.0, WIN_W - SIDEBAR_W);
 
     double age = mono_sec() - g_ui.toast_t;
     const char *msg = g_ui.page == PAGE_STARTUP
@@ -1126,18 +1128,18 @@ static void paint_footer(cairo_t *cr)
     }
 
     rgba(cr, col, alpha);
-    cairo_arc(cr, CONTENT_X + 3.0, 704.0, 2.5, 0.0, 2.0 * PI);
+    cairo_arc(cr, CONTENT_X + 3.0, WIN_H - 16.0, 2.5, 0.0, 2.0 * PI);
     cairo_fill(cr);
     text_draw(cr, msg, 9.0, 500, col, alpha,
-              CONTENT_X + 12.0, 698.0, ALIGN_LEFT, 0.35);
+              CONTENT_X + 12.0, WIN_H - 22.0, ALIGN_LEFT, 0.35);
 
     char counter[32];
     snprintf(counter, sizeof counter, "%02d / %02d", g_ui.page + 1,
              PAGE_COUNT);
     text_draw(cr, counter, 9.0, 600, C_FAINT, 0.85,
-              WIN_W - 36.0, 698.0, ALIGN_RIGHT, 0.8);
+              WIN_W - 36.0, WIN_H - 22.0, ALIGN_RIGHT, 0.8);
     text_draw(cr, "↑ ↓ · Esc to quit", 9.0, 400, C_FAINT, 0.7,
-              WIN_W - 96.0, 698.0, ALIGN_RIGHT, 0.2);
+              WIN_W - 96.0, WIN_H - 22.0, ALIGN_RIGHT, 0.2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1200,7 +1202,9 @@ static void page_keybindings(cairo_t *cr)
         cx += paint_chip(cr, filters[i], cx, 110.0, i == 0) + 8.0;
     }
 
-    double tx = CONTENT_X, ty = 152.0, tw = CONTENT_W, th = 466.0;
+    double tx = CONTENT_X, ty = 152.0, tw = CONTENT_W;
+    double btn_y = WIN_H - 86.0;
+    double th = btn_y - 16.0 - ty;
     paint_card(cr, tx, ty, tw, th);
 
     text_draw(cr, "ACTION", 8.0, 600, C_FAINT, 0.9,
@@ -1248,12 +1252,12 @@ static void page_keybindings(cairo_t *cr)
             paint_divider(cr, tx + 20.0, ry + 41.0, tw - 40.0);
     }
 
-    paint_button(cr, CONTENT_X, 634.0, 150.0, 36.0,
+    paint_button(cr, CONTENT_X, btn_y, 150.0, 36.0,
                  "Add keybinding", 1, BTN_ADD_BINDING);
-    paint_button(cr, CONTENT_X + 162.0, 634.0, 158.0, 36.0,
+    paint_button(cr, CONTENT_X + 162.0, btn_y, 158.0, 36.0,
                  "Reset to defaults", 0, BTN_ADD_BINDING);
     text_draw(cr, "Click a row to select it", 9.0, 400, C_FAINT, 0.8,
-              WIN_W - 36.0, 645.0, ALIGN_RIGHT, 0.2);
+              WIN_W - 36.0, btn_y + 11.0, ALIGN_RIGHT, 0.2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1502,7 +1506,9 @@ static void page_startup(cairo_t *cr)
     text_draw(cr, "Applications launched when the jtlabwc session starts",
               9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
 
-    double tx = CONTENT_X, ty = 142.0, tw = CONTENT_W, th = 444.0;
+    double tx = CONTENT_X, ty = 142.0, tw = CONTENT_W;
+    double by = WIN_H - 122.0;
+    double th = (by - 12.0) - ty;
     paint_card(cr, tx, ty, tw, th);
 
     text_draw(cr, "APPLICATION", 8.0, 600, C_FAINT, 0.9,
@@ -1513,10 +1519,11 @@ static void page_startup(cairo_t *cr)
 
     if (g_startup_count == 0) {
         text_draw(cr, "No startup applications", 14.0, 600, C_FG, 0.9,
-                  tx + tw / 2.0, ty + 168.0, ALIGN_CENTER, 0.15);
+                  tx + tw / 2.0, ty + th / 2.0 - 54.0,
+                  ALIGN_CENTER, 0.15);
         text_draw(cr,
                   "Add an application and it will launch with your session.",
-                  9.5, 400, C_DIM, 0.72, tx + tw / 2.0, ty + 194.0,
+                  9.5, 400, C_DIM, 0.72, tx + tw / 2.0, ty + th / 2.0 - 28.0,
                   ALIGN_CENTER, 0.1);
     }
 
@@ -1581,10 +1588,12 @@ static void page_startup(cairo_t *cr)
                             "Add application", BTN_START_ADD);
     }
 
-    double by = 598.0, bh = 72.0;
-    paint_card(cr, CONTENT_X, by, 368.0, bh);
+    double bh = 72.0;
+    double col_w = (CONTENT_W - 20.0) / 2.0;
+    double col2 = CONTENT_X + col_w + 20.0;
+    paint_card(cr, CONTENT_X, by, col_w, bh);
     char v[32];
-    paint_slider_row(cr, CONTENT_X + 18.0, by + 12.0, 332.0,
+    paint_slider_row(cr, CONTENT_X + 18.0, by + 12.0, col_w - 36.0,
                      "Launch delay",
                      slider_text(SL_START_DELAY,
                                  g_ui.sliders[SL_START_DELAY], v, sizeof v),
@@ -1592,13 +1601,13 @@ static void page_startup(cairo_t *cr)
     text_draw(cr, "Wait before the first application starts", 8.5, 400,
               C_FAINT, 0.8, CONTENT_X + 18.0, by + 50.0, ALIGN_LEFT, 0.1);
 
-    paint_card(cr, CONTENT_X + 388.0, by, 368.0, bh);
+    paint_card(cr, col2, by, col_w, bh);
     text_draw(cr, "AUTOSTART FILE", 8.0, 600, C_FAINT, 0.9,
-              CONTENT_X + 406.0, by + 14.0, ALIGN_LEFT, 1.4);
+              col2 + 18.0, by + 14.0, ALIGN_LEFT, 1.4);
     text_draw(cr, "~/.config/jt/startup.conf", 10.0, 500, C_ACCENT, 0.95,
-              CONTENT_X + 406.0, by + 32.0, ALIGN_LEFT, 0.2);
+              col2 + 18.0, by + 32.0, ALIGN_LEFT, 0.2);
     text_draw(cr, "Changes are written immediately", 8.5, 400, C_DIM, 0.75,
-              CONTENT_X + 406.0, by + 50.0, ALIGN_LEFT, 0.1);
+              col2 + 18.0, by + 50.0, ALIGN_LEFT, 0.1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1639,24 +1648,30 @@ static void page_rules(cairo_t *cr)
     text_draw(cr, "Rules are matched top to bottom; the first match wins",
               9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
 
+    double btn_y = WIN_H - 180.0;
+    double card_h = 116.0;
+    double gap = 14.0 + (WIN_H - DESIGN_H) / (RULE_COUNT - 1);
+    if (gap < 14.0)
+        gap = 14.0;
+
     for (int i = 0; i < RULE_COUNT; i++) {
-        double ry = 142.0 + i * 130.0;
-        int idx = add_hit(HIT_ROW, i, 0, CONTENT_X, ry, CONTENT_W, 116.0);
+        double ry = 142.0 + i * (card_h + gap);
+        int idx = add_hit(HIT_ROW, i, 0, CONTENT_X, ry, CONTENT_W, card_h);
         int sel = g_ui.selected[PAGE_RULES] == i;
         int hot = hit_hover(idx);
 
-        paint_card(cr, CONTENT_X, ry, CONTENT_W, 116.0);
+        paint_card(cr, CONTENT_X, ry, CONTENT_W, card_h);
         if (sel) {
             rgba(cr, C_ACCENT, 0.55);
             cairo_set_line_width(cr, 1.2);
             rounded_rect(cr, CONTENT_X + 0.6, ry + 0.6, CONTENT_W - 1.2,
-                         114.8, 9.4);
+                         card_h - 1.2, 9.4);
             cairo_stroke(cr);
         } else if (hot) {
             rgba(cr, C_FG, 0.20);
             cairo_set_line_width(cr, 1.0);
             rounded_rect(cr, CONTENT_X + 0.5, ry + 0.5, CONTENT_W - 1.0,
-                         115.0, 9.5);
+                         card_h - 1.0, 9.5);
             cairo_stroke(cr);
         }
 
@@ -1685,14 +1700,14 @@ static void page_rules(cairo_t *cr)
                           g_ui.toggles[RULES[i].toggle], RULES[i].toggle);
     }
 
-    paint_dashed_button(cr, CONTENT_X, 540.0, CONTENT_W, 52.0,
+    paint_dashed_button(cr, CONTENT_X, btn_y, CONTENT_W, 52.0,
                         "New window rule", BTN_NEW_RULE);
 
     text_wrap(cr,
         "A finished app would read and write these rules in "
         "~/.config/labwc/rc.xml, then ask jtlabwc to reload. The preview "
         "keeps everything local.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, 612.0, CONTENT_W, 2);
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, WIN_H - 108.0, CONTENT_W, 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1701,68 +1716,73 @@ static void page_rules(cairo_t *cr)
 
 static void page_input(cairo_t *cr)
 {
+    double col_w = (CONTENT_W - 20.0) / 2.0;
+    double col2 = CONTENT_X + col_w + 20.0;
+    double inner = col_w - 36.0;
+
     section_label(cr, "POINTER & TOUCHPAD", CONTENT_X, 102.0);
-    section_label(cr, "KEYBOARD", CONTENT_X + 388.0, 102.0);
+    section_label(cr, "KEYBOARD", col2, 102.0);
 
     char v[32];
-    double cy = 122.0, ch = 300.0;
+    double cy = 122.0;
+    double gy = WIN_H - 278.0;
+    double ch = gy - 20.0 - cy;
 
-    paint_card(cr, CONTENT_X, cy, 368.0, ch);
-    paint_card(cr, CONTENT_X + 388.0, cy, 368.0, ch);
+    paint_card(cr, CONTENT_X, cy, col_w, ch);
+    paint_card(cr, col2, cy, col_w, ch);
 
     double lx = CONTENT_X + 18.0;
     text_draw(cr, "Pointer", 12.0, 600, 0xE8E8E8, 0.95,
               lx, cy + 14.0, ALIGN_LEFT, 0.1);
 
-    paint_slider_row(cr, lx, cy + 44.0, 332.0, "Pointer speed",
+    paint_slider_row(cr, lx, cy + 44.0, inner, "Pointer speed",
                      slider_text(SL_POINTER, g_ui.sliders[SL_POINTER],
                                  v, sizeof v),
                      g_ui.sliders[SL_POINTER], SL_POINTER);
-    paint_divider(cr, lx, cy + 88.0, 332.0);
+    paint_divider(cr, lx, cy + 88.0, inner);
 
-    paint_toggle_row(cr, lx, cy + 98.0, 332.0, "Natural scrolling",
+    paint_toggle_row(cr, lx, cy + 98.0, inner, "Natural scrolling",
                      "Content follows your fingers",
                      g_ui.toggles[TOG_NATURAL], TOG_NATURAL);
-    paint_toggle_row(cr, lx, cy + 140.0, 332.0, "Tap to click",
+    paint_toggle_row(cr, lx, cy + 140.0, inner, "Tap to click",
                      "Tap the touchpad to press",
                      g_ui.toggles[TOG_TAP], TOG_TAP);
-    paint_toggle_row(cr, lx, cy + 182.0, 332.0, "Tap and drag",
+    paint_toggle_row(cr, lx, cy + 182.0, inner, "Tap and drag",
                      "Drag with one finger held down",
                      g_ui.toggles[TOG_DRAG], TOG_DRAG);
-    paint_toggle_row(cr, lx, cy + 224.0, 332.0, "Disable while typing",
+    paint_toggle_row(cr, lx, cy + 224.0, inner, "Disable while typing",
                      "Ignore taps for a short moment",
                      g_ui.toggles[TOG_LOCK_SUSPEND], TOG_LOCK_SUSPEND);
-    paint_toggle_row(cr, lx, cy + 266.0, 332.0, "Left-handed",
+    paint_toggle_row(cr, lx, cy + 266.0, inner, "Left-handed",
                      "Swap the primary mouse button",
                      g_ui.toggles[TOG_LEFT], TOG_LEFT);
 
-    double rx = CONTENT_X + 388.0 + 18.0;
+    double rx = col2 + 18.0;
     text_draw(cr, "Keyboard", 12.0, 600, 0xE8E8E8, 0.95,
               rx, cy + 14.0, ALIGN_LEFT, 0.1);
 
     text_draw(cr, "Layout", 11.5, 500, 0xD2D2D2, 0.94,
               rx, cy + 44.0, ALIGN_LEFT, 0.1);
-    paint_field(cr, rx, cy + 62.0, 332.0, 32.0,
+    paint_field(cr, rx, cy + 62.0, inner, 32.0,
                 "English (US) · intl", 1);
 
-    paint_slider_row(cr, rx, cy + 108.0, 332.0, "Repeat rate",
+    paint_slider_row(cr, rx, cy + 108.0, inner, "Repeat rate",
                      slider_text(SL_REPEAT, g_ui.sliders[SL_REPEAT],
                                  v, sizeof v),
                      g_ui.sliders[SL_REPEAT], SL_REPEAT);
-    paint_slider_row(cr, rx, cy + 156.0, 332.0, "Repeat delay",
+    paint_slider_row(cr, rx, cy + 156.0, inner, "Repeat delay",
                      slider_text(SL_DELAY, g_ui.sliders[SL_DELAY],
                                  v, sizeof v),
                      g_ui.sliders[SL_DELAY], SL_DELAY);
 
-    paint_divider(cr, rx, cy + 200.0, 332.0);
+    paint_divider(cr, rx, cy + 200.0, inner);
 
     text_draw(cr, "Compose key", 11.5, 500, 0xD2D2D2, 0.94,
               rx, cy + 212.0, ALIGN_LEFT, 0.1);
-    paint_field(cr, rx, cy + 230.0, 332.0, 32.0, "Disabled", 1);
+    paint_field(cr, rx, cy + 230.0, inner, 32.0, "Disabled", 1);
     text_draw(cr, "Layout changes apply to all keyboards", 8.5, 400,
               C_FAINT, 0.8, rx, cy + 272.0, ALIGN_LEFT, 0.1);
 
-    double gy = 442.0;
     paint_card(cr, CONTENT_X, gy, CONTENT_W, 104.0);
     text_draw(cr, "Touchpad gestures", 12.0, 600, 0xE8E8E8, 0.95,
               CONTENT_X + 18.0, gy + 16.0, ALIGN_LEFT, 0.1);
@@ -1770,10 +1790,10 @@ static void page_input(cairo_t *cr)
               CONTENT_X + 18.0, gy + 42.0, ALIGN_LEFT, 0.2);
 
     static const char *const scrolls[] = { "Two finger", "Edge", "Button" };
-    paint_segment(cr, CONTENT_X + 18.0, gy + 58.0, 332.0, 30.0,
+    paint_segment(cr, CONTENT_X + 18.0, gy + 58.0, inner, 30.0,
                   scrolls, 3, g_ui.segments[SEG_SCROLL], SEG_SCROLL);
 
-    paint_toggle_row(cr, CONTENT_X + 388.0, gy + 24.0, 332.0,
+    paint_toggle_row(cr, col2, gy + 24.0, inner,
                      "Scroll momentum",
                      "Keep gliding after the fingers lift",
                      g_ui.toggles[TOG_MOMENTUM], TOG_MOMENTUM);
@@ -1782,7 +1802,7 @@ static void page_input(cairo_t *cr)
         "Input settings are a preview. A finished app would talk to the "
         "compositor's input configuration and store the result in "
         "~/.config/labwc/rc.xml.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, 564.0, CONTENT_W, 2);
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, WIN_H - 156.0, CONTENT_W, 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1884,16 +1904,22 @@ static void page_displays(cairo_t *cr)
     text_draw(cr, "2 outputs · one active", 9.5, 400, C_DIM, 0.75,
               WIN_W - 36.0, 102.0, ALIGN_RIGHT, 0.2);
 
+    double footnote_y = WIN_H - 154.0;
+    double card_h = 206.0;
+    double gap = 14.0 + (WIN_H - DESIGN_H);
+    if (gap < 14.0)
+        gap = 14.0;
+
     display_card(cr, 122.0, "HDMI-A-1", "Dell U2720Q · 27\"",
                  1, SEG_REFRESH_A, SEG_SCALE_A, SEG_ORIENT_A, TOG_PRIMARY_A);
-    display_card(cr, 342.0, "DP-1", "Unknown display",
+    display_card(cr, 122.0 + card_h + gap, "DP-1", "Unknown display",
                  0, SEG_REFRESH_B, SEG_SCALE_B, SEG_ORIENT_B, TOG_PRIMARY_B);
 
     text_wrap(cr,
         "Output changes are shown locally. Writing them for real would mean "
         "updating the compositor's output configuration and asking jtlabwc "
         "to apply it.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, 566.0, CONTENT_W, 2);
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, footnote_y, CONTENT_W, 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1902,36 +1928,42 @@ static void page_displays(cairo_t *cr)
 
 static void page_session(cairo_t *cr)
 {
+    double col_w = (CONTENT_W - 20.0) / 2.0;
+    double col2 = CONTENT_X + col_w + 20.0;
+    double inner = col_w - 36.0;
+    double row_w = col_w - 20.0;
+
     section_label(cr, "IDLE & LOCK", CONTENT_X, 102.0);
-    section_label(cr, "POWER COMMANDS", CONTENT_X + 388.0, 102.0);
+    section_label(cr, "POWER COMMANDS", col2, 102.0);
 
     char v[32];
-    double cy = 122.0, ch = 232.0;
+    double cy = 122.0;
+    double by = WIN_H - 344.0;
+    double ch = by - 22.0 - cy;
 
-    paint_card(cr, CONTENT_X, cy, 368.0, ch);
+    paint_card(cr, CONTENT_X, cy, col_w, ch);
     double lx = CONTENT_X + 18.0;
     text_draw(cr, "Away from the keyboard", 12.0, 600, 0xE8E8E8, 0.95,
               lx, cy + 14.0, ALIGN_LEFT, 0.1);
 
-    paint_slider_row(cr, lx, cy + 44.0, 332.0, "Idle timeout",
+    paint_slider_row(cr, lx, cy + 44.0, inner, "Idle timeout",
                      slider_text(SL_IDLE, g_ui.sliders[SL_IDLE], v, sizeof v),
                      g_ui.sliders[SL_IDLE], SL_IDLE);
-    paint_divider(cr, lx, cy + 88.0, 332.0);
+    paint_divider(cr, lx, cy + 88.0, inner);
 
-    paint_toggle_row(cr, lx, cy + 98.0, 332.0, "Lock when idle",
+    paint_toggle_row(cr, lx, cy + 98.0, inner, "Lock when idle",
                      "Require a password after the timeout",
                      g_ui.toggles[TOG_IDLE_LOCK], TOG_IDLE_LOCK);
-    paint_toggle_row(cr, lx, cy + 140.0, 332.0, "Dim before locking",
+    paint_toggle_row(cr, lx, cy + 140.0, inner, "Dim before locking",
                      "Fade the screen one minute early",
                      g_ui.toggles[TOG_DIM], TOG_DIM);
-    paint_toggle_row(cr, lx, cy + 182.0, 332.0, "Lock on suspend",
+    paint_toggle_row(cr, lx, cy + 182.0, inner, "Lock on suspend",
                      "Never wake straight into the desktop",
                      g_ui.toggles[TOG_LOCK_SUSPEND], TOG_LOCK_SUSPEND);
 
-    double rx = CONTENT_X + 388.0;
-    paint_card(cr, rx, cy, 368.0, ch);
+    paint_card(cr, col2, cy, col_w, ch);
     text_draw(cr, "End the session", 12.0, 600, 0xE8E8E8, 0.95,
-              rx + 18.0, cy + 14.0, ALIGN_LEFT, 0.1);
+              col2 + 18.0, cy + 14.0, ALIGN_LEFT, 0.1);
 
     static const struct {
         const char *label;
@@ -1949,61 +1981,60 @@ static void page_session(cairo_t *cr)
     for (int i = 0; i < 4; i++) {
         double ry = cy + 42.0 + i * 44.0;
         int idx = add_hit(HIT_BUTTON, commands[i].button, 0,
-                          rx + 10.0, ry, 348.0, 40.0);
+                          col2 + 10.0, ry, row_w, 40.0);
         int hot = hit_hover(idx);
 
         if (hot) {
             rgba(cr, C_FG, 0.04);
-            rounded_rect(cr, rx + 10.0, ry, 348.0, 40.0, 7.0);
+            rounded_rect(cr, col2 + 10.0, ry, row_w, 40.0, 7.0);
             cairo_fill(cr);
         }
 
         rgba(cr, i >= 2 ? C_RED : C_ACCENT, i >= 2 ? 0.75 : 0.85);
-        cairo_arc(cr, rx + 28.0, ry + 20.0, 2.6, 0.0, 2.0 * PI);
+        cairo_arc(cr, col2 + 28.0, ry + 20.0, 2.6, 0.0, 2.0 * PI);
         cairo_fill(cr);
 
         text_draw(cr, commands[i].label, 11.0, 600, 0xDCDCDC, 0.95,
-                  rx + 42.0, ry + 6.0, ALIGN_LEFT, 0.1);
+                  col2 + 42.0, ry + 6.0, ALIGN_LEFT, 0.1);
         text_draw(cr, commands[i].desc, 8.5, 400, C_DIM, 0.72,
-                  rx + 42.0, ry + 23.0, ALIGN_LEFT, 0.1);
+                  col2 + 42.0, ry + 23.0, ALIGN_LEFT, 0.1);
 
         if (commands[i].key1[0]) {
             double kw = keycap_width(cr, commands[i].key1) + 5.0 +
                         keycap_width(cr, commands[i].key2);
-            double kx = rx + 348.0 - kw;
+            double kx = col2 + row_w - kw;
             kx += paint_keycap(cr, commands[i].key1, kx, ry + 10.0) + 5.0;
             paint_keycap(cr, commands[i].key2, kx, ry + 10.0);
         }
     }
 
-    double by = 376.0;
     paint_card(cr, CONTENT_X, by, CONTENT_W, 196.0);
     text_draw(cr, "Session", 12.0, 600, 0xE8E8E8, 0.95,
               CONTENT_X + 18.0, by + 16.0, ALIGN_LEFT, 0.1);
 
-    paint_toggle_row(cr, CONTENT_X + 18.0, by + 48.0, 332.0,
+    paint_toggle_row(cr, CONTENT_X + 18.0, by + 48.0, inner,
                      "Restore previous windows",
                      "Reopen apps from the last session",
                      g_ui.toggles[TOG_RESTORE], TOG_RESTORE);
-    paint_toggle_row(cr, CONTENT_X + 18.0, by + 90.0, 332.0,
+    paint_toggle_row(cr, CONTENT_X + 18.0, by + 90.0, inner,
                      "Start on last workspace",
                      "Remember the active desktop",
                      g_ui.toggles[TOG_LAST_WS], TOG_LAST_WS);
 
-    double rx2 = CONTENT_X + 388.0;
+    double rx2 = col2;
     text_draw(cr, "Startup workspace", 9.0, 500, C_DIM, 0.85,
               rx2, by + 46.0, ALIGN_LEFT, 0.2);
-    paint_field(cr, rx2, by + 62.0, 332.0, 32.0, "Workspace 1", 1);
+    paint_field(cr, rx2, by + 62.0, inner, 32.0, "Workspace 1", 1);
 
     text_draw(cr, "Environment file", 9.0, 500, C_DIM, 0.85,
               rx2, by + 106.0, ALIGN_LEFT, 0.2);
-    paint_field(cr, rx2, by + 122.0, 332.0, 32.0,
+    paint_field(cr, rx2, by + 122.0, inner, 32.0,
                 "~/.config/labwc/environment", 0);
 
     text_wrap(cr,
         "Power commands are drawn as real rows, but pressing one only shows "
         "a preview message. Nothing is executed.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, 592.0, CONTENT_W, 2);
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, WIN_H - 128.0, CONTENT_W, 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2044,7 +2075,9 @@ static void page_about(cairo_t *cr)
     text_draw(cr, "0.1.0  ·  preview build", 9.0, 600, C_ACCENT, 0.95,
               cx, 263.0, ALIGN_CENTER, 0.6);
 
-    double gx = CONTENT_X, gy = 304.0, gw = CONTENT_W, gh = 214.0;
+    double gx = CONTENT_X, gy = 304.0, gw = CONTENT_W;
+    double btn_y = WIN_H - 172.0;
+    double gh = (btn_y - 30.0) - gy;
     paint_card(cr, gx, gy, gw, gh);
 
     static const char *const keys[] = {
@@ -2072,15 +2105,17 @@ static void page_about(cairo_t *cr)
             paint_divider(cr, gx + 24.0, ky + 48.0, gw - 48.0);
     }
 
-    paint_button(cr, cx - 182.0, 548.0, 170.0, 40.0,
+    paint_button(cr, cx - 182.0, btn_y, 170.0, 40.0,
                  "Documentation", 0, BTN_DOCS);
-    paint_button(cr, cx + 12.0, 548.0, 170.0, 40.0,
+    paint_button(cr, cx + 12.0, btn_y, 170.0, 40.0,
                  "Check for updates", 1, BTN_UPDATE);
 
     text_draw(cr, "Built for the JTLab desktop · made with care",
-              9.0, 400, C_FAINT, 0.8, cx, 614.0, ALIGN_CENTER, 0.3);
+              9.0, 400, C_FAINT, 0.8, cx, WIN_H - 106.0,
+              ALIGN_CENTER, 0.3);
     text_draw(cr, "Source: ~/jtsettings/jtsettings.c",
-              8.5, 400, C_FAINT, 0.7, cx, 634.0, ALIGN_CENTER, 0.2);
+              8.5, 400, C_FAINT, 0.7, cx, WIN_H - 86.0,
+              ALIGN_CENTER, 0.2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2430,11 +2465,13 @@ static void toplevel_configure(void *data, struct xdg_toplevel *t,
                                int32_t width, int32_t height,
                                struct wl_array *states)
 {
-    (void)data;
     (void)t;
-    (void)width;
-    (void)height;
     (void)states;
+    (void)data;
+    if (width > 0 && height > 0) {
+        WIN_W = width;
+        WIN_H = height;
+    }
 }
 
 static void toplevel_close(void *data, struct xdg_toplevel *t)
@@ -3059,8 +3096,7 @@ static int wayland_start(App *a)
     xdg_toplevel_add_listener(a->toplevel, &toplevel_listener, a);
     xdg_toplevel_set_title(a->toplevel, "JTLab Settings");
     xdg_toplevel_set_app_id(a->toplevel, "jtsettings");
-    xdg_toplevel_set_min_size(a->toplevel, (int)WIN_W, (int)WIN_H);
-    xdg_toplevel_set_max_size(a->toplevel, (int)WIN_W, (int)WIN_H);
+    xdg_toplevel_set_min_size(a->toplevel, (int)DESIGN_W, (int)DESIGN_H);
 
     if (a->deco_manager) {
         a->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
