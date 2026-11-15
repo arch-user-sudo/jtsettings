@@ -413,7 +413,7 @@ enum {
     TOG_RULE_PIP,
     TOG_RULE_TERM,
     TOG_RULE_WEB,
-    TOG_MOMENTUM,
+    TOG_MIDDLE,
     TOG_IDLE_LOCK,
     TOG_DIM,
     TOG_LOCK_SUSPEND,
@@ -435,6 +435,8 @@ enum {
 
 enum {
     SEG_SCROLL,
+    SEG_ACCEL,
+    SEG_KB_FILTER,
     SEG_REFRESH_A,
     SEG_SCALE_A,
     SEG_ORIENT_A,
@@ -452,11 +454,11 @@ enum {
     HIT_SEGMENT,
     HIT_ROW,
     HIT_BUTTON,
-    HIT_START_TOGGLE
+    HIT_START_TOGGLE,
+    HIT_TERM_FIELD
 };
 
 enum {
-    BTN_ADD_BINDING,
     BTN_NEW_RULE,
     BTN_DOCS,
     BTN_UPDATE,
@@ -489,6 +491,14 @@ typedef struct {
     double pointer_x, pointer_y;
     int startup_adding;
     char startup_input[STARTUP_CMD_MAX];
+    int terminal_editing;
+    char terminal_input[128];
+    char terminal[128];
+    double kb_scroll;
+    int kb_drag;
+    int kb_drag_moved;
+    double kb_drag_y;
+    double kb_drag_scroll;
     char toast[96];
     double toast_t;
 } Ui;
@@ -498,6 +508,21 @@ static Ui g_ui;
 /* Defined below, once the startup list is in scope. */
 static int startup_load(void);
 static void startup_save(void);
+
+/* Pointer, touchpad and keyboard repeat settings live in
+ * ~/.config/jt/input.conf and are applied by jtlabwc over its control
+ * socket. */
+static int input_load(void);
+static void input_save(void);
+static void jtlabwc_reload(void);
+static void input_commit(void);
+static int input_toggle(int toggle);
+
+/* The default terminal command lives in ~/.config/jt/keybinds.conf. */
+static int keybinds_load(void);
+static void keybinds_save(void);
+static void terminal_input_commit(void);
+static void terminal_input_cancel(void);
 
 static void ui_toast(const char *msg)
 {
@@ -523,7 +548,7 @@ static void ui_init(void)
     g_ui.toggles[TOG_RULE_PIP] = 1;
     g_ui.toggles[TOG_RULE_TERM] = 1;
     g_ui.toggles[TOG_RULE_WEB] = 0;
-    g_ui.toggles[TOG_MOMENTUM] = 1;
+    g_ui.toggles[TOG_MIDDLE] = 0;
     g_ui.toggles[TOG_IDLE_LOCK] = 1;
     g_ui.toggles[TOG_DIM] = 1;
     g_ui.toggles[TOG_LOCK_SUSPEND] = 1;
@@ -533,12 +558,13 @@ static void ui_init(void)
     g_ui.toggles[TOG_PRIMARY_B] = 0;
 
     g_ui.sliders[SL_POINTER] = 0.52;
-    g_ui.sliders[SL_REPEAT] = 0.58;
-    g_ui.sliders[SL_DELAY] = 0.35;
+    g_ui.sliders[SL_REPEAT] = (45.0 - 15.0) / 65.0;
+    g_ui.sliders[SL_DELAY] = (250.0 - 150.0) / 550.0;
     g_ui.sliders[SL_START_DELAY] = 0.0;
     g_ui.sliders[SL_IDLE] = 0.45;
 
     g_ui.segments[SEG_SCROLL] = 0;
+    g_ui.segments[SEG_KB_FILTER] = 0;
     g_ui.segments[SEG_REFRESH_A] = 1;
     g_ui.segments[SEG_SCALE_A] = 0;
     g_ui.segments[SEG_ORIENT_A] = 0;
@@ -553,6 +579,12 @@ static void ui_init(void)
      * file, every startup entry starts disabled rather than showing preview
      * defaults; enabling one writes the file. */
     (void)startup_load();
+
+    /* Saved pointer settings override the defaults in the same way. */
+    (void)input_load();
+
+    /* Default terminal command; falls back to footclient. */
+    (void)keybinds_load();
 }
 
 static int add_hit(int kind, int a, int b,
@@ -1171,6 +1203,10 @@ static void paint_footer(cairo_t *cr)
     double age = mono_sec() - g_ui.toast_t;
     const char *msg = g_ui.page == PAGE_STARTUP
         ? "AUTOSTART · ~/.config/jt/startup.conf"
+        : g_ui.page == PAGE_KEYBINDINGS
+        ? "BUILT-IN SHORTCUTS · jtlabwc"
+        : g_ui.page == PAGE_INPUT
+        ? "INPUT · ~/.config/jt/input.conf"
         : "PREVIEW · changes are not saved";
     unsigned col = C_FAINT;
     double alpha = 0.9;
@@ -1208,18 +1244,96 @@ typedef struct {
     int nkeys;
 } KeybindRow;
 
+/* These mirror the built-in key_combos table in jtlabwc.c.  The page is a
+ * read-only view of what the compositor actually binds at startup. */
 static const KeybindRow KEYBINDS[] = {
+    { "Next window",          "Window",    { "Super", "J" }, 2 },
+    { "Previous window",      "Window",    { "Super", "K" }, 2 },
     { "Open terminal",        "Session",   { "Super", "Return" }, 2 },
-    { "Close window",         "Window",    { "Super", "Q" }, 2 },
-    { "Toggle maximize",      "Window",    { "Super", "M" }, 2 },
-    { "Move window left",     "Window",    { "Super", "Ctrl", "Left" }, 3 },
+    { "Close window",         "Window",    { "Super", "Shift", "Q" }, 3 },
+    { "Toggle maximize",      "Window",    { "Super", "A" }, 2 },
+    { "Minimize window",      "Window",    { "Super", "M" }, 2 },
+    { "Show desktop",         "Window",    { "Super", "D" }, 2 },
+    { "Toggle fullscreen",    "Window",    { "Super", "Y" }, 2 },
     { "Workspace 1",          "Workspace", { "Super", "1" }, 2 },
-    { "Next workspace",       "Workspace", { "Super", "Right" }, 2 },
-    { "Application launcher", "Session",   { "Super", "Space" }, 2 },
-    { "Lock screen",          "Session",   { "Super", "L" }, 2 },
-    { "Screenshot region",    "Media",     { "Print" }, 1 },
+    { "Workspace 2",          "Workspace", { "Super", "2" }, 2 },
+    { "Workspace 3",          "Workspace", { "Super", "3" }, 2 },
+    { "Workspace 4",          "Workspace", { "Super", "4" }, 2 },
+    { "Workspace 5",          "Workspace", { "Super", "5" }, 2 },
+    { "Workspace 6",          "Workspace", { "Super", "6" }, 2 },
+    { "Workspace 7",          "Workspace", { "Super", "7" }, 2 },
+    { "Workspace 8",          "Workspace", { "Super", "8" }, 2 },
+    { "Workspace 9",          "Workspace", { "Super", "9" }, 2 },
+    { "Send to workspace 1",  "Workspace", { "Super", "Shift", "1" }, 3 },
+    { "Send to workspace 2",  "Workspace", { "Super", "Shift", "2" }, 3 },
+    { "Send to workspace 3",  "Workspace", { "Super", "Shift", "3" }, 3 },
+    { "Send to workspace 4",  "Workspace", { "Super", "Shift", "4" }, 3 },
+    { "Send to workspace 5",  "Workspace", { "Super", "Shift", "5" }, 3 },
+    { "Send to workspace 6",  "Workspace", { "Super", "Shift", "6" }, 3 },
+    { "Send to workspace 7",  "Workspace", { "Super", "Shift", "7" }, 3 },
+    { "Send to workspace 8",  "Workspace", { "Super", "Shift", "8" }, 3 },
+    { "Send to workspace 9",  "Workspace", { "Super", "Shift", "9" }, 3 },
+    { "Snap left",            "Window",    { "Super", "Shift", "H" }, 3 },
+    { "Snap right",           "Window",    { "Super", "Shift", "L" }, 3 },
+    { "Snap up",              "Window",    { "Super", "Shift", "K" }, 3 },
+    { "Snap down",            "Window",    { "Super", "Shift", "J" }, 3 },
+    { "Unsnap window",        "Window",    { "Super", "Shift", "A" }, 3 },
+    { "Window menu",          "Window",    { "Super", "I" }, 2 },
+    { "Application menu",     "Session",   { "Super", "Space" }, 2 },
+    { "Volume down",          "Media",     { "Vol-" }, 1 },
+    { "Volume up",            "Media",     { "Vol+" }, 1 },
+    { "Mute audio",           "Media",     { "Mute" }, 1 },
+    { "Brightness up",        "Media",     { "Bri+" }, 1 },
+    { "Brightness down",      "Media",     { "Bri-" }, 1 },
 };
 #define KEYBIND_COUNT ((int)(sizeof KEYBINDS / sizeof KEYBINDS[0]))
+
+static const char *const KB_FILTERS[] = {
+    "All", "Window", "Workspace", "Session", "Media",
+};
+#define KB_FILTER_COUNT ((int)(sizeof KB_FILTERS / sizeof KB_FILTERS[0]))
+
+static int kb_filter_active(void)
+{
+    int f = g_ui.segments[SEG_KB_FILTER];
+    return (f >= 0 && f < KB_FILTER_COUNT) ? f : 0;
+}
+
+static int kb_row_matches(int i)
+{
+    int f = kb_filter_active();
+    return f == 0 || !strcmp(KEYBINDS[i].context, KB_FILTERS[f]);
+}
+
+static int kb_filtered_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < KEYBIND_COUNT; i++)
+        if (kb_row_matches(i))
+            n++;
+    return n;
+}
+
+#define KB_ROW_H     43.0
+#define KB_HEADER_H  44.0
+#define KB_BOTTOM_GAP 62.0
+
+static void kb_geom(double *ty, double *th, double *view_h)
+{
+    *ty = 182.0;
+    *th = WIN_H - KB_BOTTOM_GAP - *ty;
+    *view_h = *th - KB_HEADER_H;
+}
+
+static double kb_max_scroll(void)
+{
+    double ty, th, view_h;
+    kb_geom(&ty, &th, &view_h);
+    (void)ty;
+    (void)th;
+    double total = kb_filtered_count() * KB_ROW_H;
+    return total > view_h ? total - view_h : 0.0;
+}
 
 static void paint_search_icon(cairo_t *cr, double x, double y)
 {
@@ -1246,20 +1360,76 @@ static void page_keybindings(cairo_t *cr)
     text_draw(cr, "Search shortcuts…", 10.5, 500, C_DIM, 0.72,
               fx + 32.0, fy + 10.0, ALIGN_LEFT, 0.1);
 
-    static const char *const filters[] = { "All", "Window", "Workspace", "Media" };
     double total = 0.0;
-    for (int i = 0; i < 4; i++) {
-        total += chip_width(cr, filters[i]);
-        if (i < 3) total += 8.0;
+    for (int i = 0; i < KB_FILTER_COUNT; i++) {
+        total += chip_width(cr, KB_FILTERS[i]);
+        if (i < KB_FILTER_COUNT - 1) total += 8.0;
     }
     double cx = WIN_W - 36.0 - total;
-    for (int i = 0; i < 4; i++) {
-        cx += paint_chip(cr, filters[i], cx, 110.0, i == 0) + 8.0;
+    int active_filter = kb_filter_active();
+    for (int i = 0; i < KB_FILTER_COUNT; i++) {
+        double w = chip_width(cr, KB_FILTERS[i]);
+        (void)add_hit(HIT_SEGMENT, SEG_KB_FILTER, i, cx, 110.0, w, 22.0);
+        paint_chip(cr, KB_FILTERS[i], cx, 110.0, i == active_filter);
+        cx += w + 8.0;
     }
 
-    double tx = CONTENT_X, ty = 152.0, tw = CONTENT_W;
-    double btn_y = WIN_H - 86.0;
-    double th = btn_y - 16.0 - ty;
+    /* Default terminal command, used by the Super+Return binding. */
+    double term_y = 140.0, term_h = 30.0;
+    double field_x = CONTENT_X + 112.0, field_w = 360.0;
+    int term_idx = add_hit(HIT_TERM_FIELD, 0, 0,
+                           field_x, term_y, field_w, term_h);
+    int term_hot = hit_hover(term_idx);
+
+    text_draw(cr, "Default terminal", 9.5, 500, C_DIM, 0.9,
+              CONTENT_X, term_y + 9.0, ALIGN_LEFT, 0.1);
+
+    rgba(cr, C_TRACK, 0.9);
+    rounded_rect(cr, field_x, term_y, field_w, term_h, 7.0);
+    cairo_fill(cr);
+    rgba(cr, g_ui.terminal_editing ? C_ACCENT : C_BORDER,
+         g_ui.terminal_editing ? 0.85 : (term_hot ? 0.7 : 0.5));
+    cairo_set_line_width(cr, 1.0);
+    rounded_rect(cr, field_x + 0.5, term_y + 0.5, field_w - 1.0,
+                 term_h - 1.0, 6.5);
+    cairo_stroke(cr);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, field_x + 1.0, term_y + 1.0,
+                    field_w - 2.0, term_h - 2.0);
+    cairo_clip(cr);
+    if (g_ui.terminal_editing) {
+        const char *input = g_ui.terminal_input;
+        text_draw(cr, input, 10.5, 500, C_FG, 0.95,
+                  field_x + 12.0, term_y + 8.0, ALIGN_LEFT, 0.1);
+        if ((int)(g_ui.t * 2.0) % 2 == 0) {
+            double caret = field_x + 12.0 +
+                text_width(cr, input, 10.5, 500, 0.1) + 2.0;
+            rgba(cr, C_ACCENT, 0.9);
+            cairo_set_line_width(cr, 1.2);
+            cairo_move_to(cr, caret, term_y + 7.0);
+            cairo_line_to(cr, caret, term_y + 23.0);
+            cairo_stroke(cr);
+        }
+    } else {
+        text_draw(cr, g_ui.terminal, 10.5, 500, C_FG, 0.95,
+                  field_x + 12.0, term_y + 8.0, ALIGN_LEFT, 0.1);
+    }
+    cairo_restore(cr);
+
+    text_draw(cr,
+              g_ui.terminal_editing ? "Enter to save · Esc to cancel"
+                                    : "Super + Return",
+              8.5, 500, C_FAINT, 0.8, field_x + field_w + 14.0,
+              term_y + 10.0, ALIGN_LEFT, 0.2);
+
+    double tx = CONTENT_X, ty, th, view_h;
+    kb_geom(&ty, &th, &view_h);
+    double tw = CONTENT_W;
+    double max_scroll = kb_max_scroll();
+    g_ui.kb_scroll = clampd(g_ui.kb_scroll, 0.0, max_scroll);
+    double scroll = g_ui.kb_scroll;
+
     paint_card(cr, tx, ty, tw, th);
 
     text_draw(cr, "ACTION", 8.0, 600, C_FAINT, 0.9,
@@ -1270,9 +1440,28 @@ static void page_keybindings(cairo_t *cr)
               tx + tw - 20.0, ty + 14.0, ALIGN_RIGHT, 1.4);
     paint_divider(cr, tx + 20.0, ty + 36.0, tw - 40.0);
 
+    double list_top = ty + KB_HEADER_H;
+    double list_bottom = ty + th;
+
+    cairo_save(cr);
+    cairo_rectangle(cr, tx, list_top, tw, view_h);
+    cairo_clip(cr);
+
+    int visible_count = kb_filtered_count();
+    int row = 0;
     for (int i = 0; i < KEYBIND_COUNT; i++) {
-        double ry = ty + 44.0 + i * 43.0;
-        int idx = add_hit(HIT_ROW, i, 0, tx + 8.0, ry, tw - 16.0, 40.0);
+        if (!kb_row_matches(i))
+            continue;
+        double ry = list_top + row * KB_ROW_H - scroll;
+        int last = row == visible_count - 1;
+        row++;
+        if (ry + KB_ROW_H < list_top || ry > list_bottom)
+            continue;
+
+        int idx = -1;
+        if (ry >= list_top && ry + KB_ROW_H <= list_bottom)
+            idx = add_hit(HIT_ROW, i, 0, tx + 8.0, ry,
+                          tw - 16.0, 40.0);
         int sel = g_ui.selected[PAGE_KEYBINDINGS] == i;
         int hot = hit_hover(idx);
 
@@ -1303,16 +1492,31 @@ static void page_keybindings(cairo_t *cr)
             kx += paint_keycap(cr, KEYBINDS[i].keys[k], kx, ry + 9.0) + 5.0;
         }
 
-        if (i < KEYBIND_COUNT - 1)
+        if (!last)
             paint_divider(cr, tx + 20.0, ry + 41.0, tw - 40.0);
     }
+    cairo_restore(cr);
 
-    paint_button(cr, CONTENT_X, btn_y, 150.0, 36.0,
-                 "Add keybinding", 1, BTN_ADD_BINDING);
-    paint_button(cr, CONTENT_X + 162.0, btn_y, 158.0, 36.0,
-                 "Reset to defaults", 0, BTN_ADD_BINDING);
-    text_draw(cr, "Click a row to select it", 9.0, 400, C_FAINT, 0.8,
-              WIN_W - 36.0, btn_y + 11.0, ALIGN_RIGHT, 0.2);
+    if (max_scroll > 0.0) {
+        double track_x = tx + tw - 7.0;
+        double track_y = list_top + 4.0;
+        double track_h = view_h - 8.0;
+        double total_h = visible_count * KB_ROW_H;
+        double thumb_h = track_h * (view_h / total_h);
+        if (thumb_h < 28.0) thumb_h = 28.0;
+        double thumb_y = track_y +
+            (track_h - thumb_h) * (scroll / max_scroll);
+
+        rgba(cr, C_FG, 0.05);
+        rounded_rect(cr, track_x, track_y, 3.0, track_h, 1.5);
+        cairo_fill(cr);
+        rgba(cr, C_FG, 0.20);
+        rounded_rect(cr, track_x, thumb_y, 3.0, thumb_h, 1.5);
+        cairo_fill(cr);
+    }
+
+    text_draw(cr, "Built-in shortcuts · jtlabwc", 9.0, 400, C_FAINT, 0.8,
+              WIN_W - 36.0, WIN_H - 52.0, ALIGN_RIGHT, 0.2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1468,6 +1672,246 @@ startup_load(void)
     }
     fclose(f);
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Pointer & touchpad settings                                        */
+/* ------------------------------------------------------------------ */
+
+#define INPUT_DIR       "jt"
+#define INPUT_FILE      "input.conf"
+#define INPUT_PATH_MAX  512
+
+/* Keep this path and the file format in sync with jtlabwc.c. */
+static void
+input_config_path(char *buf, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(buf, n, "%s/.config/%s/%s", home, INPUT_DIR, INPUT_FILE);
+}
+
+static int
+input_toggle(int toggle)
+{
+    switch (toggle) {
+    case TOG_NATURAL:
+    case TOG_TAP:
+    case TOG_DRAG:
+    case TOG_LEFT:
+    case TOG_DWT:
+    case TOG_MIDDLE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void
+input_save(void)
+{
+    char path[INPUT_PATH_MAX];
+    input_config_path(path, sizeof path);
+    startup_mkdirs(path);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    /* jtsettings works in 0..1; libinput wants -1..1. */
+    double speed = 2.0 * clampd(g_ui.sliders[SL_POINTER], 0.0, 1.0) - 1.0;
+    static const char *const methods[] = { "two_finger", "edge", "button" };
+    int method = g_ui.segments[SEG_SCROLL];
+    if (method < 0 || method > 2) method = 0;
+    int rate = (int)(15.0 + 65.0 * clampd(g_ui.sliders[SL_REPEAT], 0.0, 1.0) + 0.5);
+    int delay = (int)(150.0 + 550.0 * clampd(g_ui.sliders[SL_DELAY], 0.0, 1.0) + 0.5);
+
+    fprintf(f, "# jtsettings input configuration\n");
+    fprintf(f, "# Written by jtsettings, read by jtlabwc.\n");
+    fprintf(f, "pointer_speed=%.3f\n", speed);
+    fprintf(f, "natural_scroll=%d\n", g_ui.toggles[TOG_NATURAL] ? 1 : 0);
+    fprintf(f, "tap=%d\n", g_ui.toggles[TOG_TAP] ? 1 : 0);
+    fprintf(f, "tap_and_drag=%d\n", g_ui.toggles[TOG_DRAG] ? 1 : 0);
+    fprintf(f, "disable_while_typing=%d\n",
+            g_ui.toggles[TOG_DWT] ? 1 : 0);
+    fprintf(f, "left_handed=%d\n", g_ui.toggles[TOG_LEFT] ? 1 : 0);
+    fprintf(f, "middle_emulation=%d\n", g_ui.toggles[TOG_MIDDLE] ? 1 : 0);
+    fprintf(f, "scroll_method=%s\n", methods[method]);
+    fprintf(f, "accel_profile=%s\n",
+            g_ui.segments[SEG_ACCEL] == 1 ? "flat" : "adaptive");
+    fprintf(f, "repeat_rate=%d\n", rate);
+    fprintf(f, "repeat_delay=%d\n", delay);
+    fclose(f);
+}
+
+static int
+input_load(void)
+{
+    char path[INPUT_PATH_MAX];
+    input_config_path(path, sizeof path);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *s = startup_trim(line);
+        if (!*s || *s == '#') continue;
+
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = startup_trim(s);
+        char *value = startup_trim(eq + 1);
+
+        if (!strcmp(key, "pointer_speed")) {
+            double speed = strtod(value, NULL);
+            speed = clampd(speed, -1.0, 1.0);
+            g_ui.sliders[SL_POINTER] = clampd((speed + 1.0) / 2.0, 0.0, 1.0);
+        } else if (!strcmp(key, "natural_scroll")) {
+            g_ui.toggles[TOG_NATURAL] = atoi(value) != 0;
+        } else if (!strcmp(key, "tap")) {
+            g_ui.toggles[TOG_TAP] = atoi(value) != 0;
+        } else if (!strcmp(key, "tap_and_drag")) {
+            g_ui.toggles[TOG_DRAG] = atoi(value) != 0;
+        } else if (!strcmp(key, "disable_while_typing")) {
+            g_ui.toggles[TOG_DWT] = atoi(value) != 0;
+        } else if (!strcmp(key, "left_handed")) {
+            g_ui.toggles[TOG_LEFT] = atoi(value) != 0;
+        } else if (!strcmp(key, "middle_emulation")) {
+            g_ui.toggles[TOG_MIDDLE] = atoi(value) != 0;
+        } else if (!strcmp(key, "scroll_method")) {
+            if (!strcmp(value, "two_finger"))
+                g_ui.segments[SEG_SCROLL] = 0;
+            else if (!strcmp(value, "edge"))
+                g_ui.segments[SEG_SCROLL] = 1;
+            else if (!strcmp(value, "button"))
+                g_ui.segments[SEG_SCROLL] = 2;
+        } else if (!strcmp(key, "accel_profile")) {
+            g_ui.segments[SEG_ACCEL] = !strcmp(value, "flat") ? 1 : 0;
+        } else if (!strcmp(key, "repeat_rate")) {
+            double rate = clampd(atoi(value), 15.0, 80.0);
+            g_ui.sliders[SL_REPEAT] = clampd((rate - 15.0) / 65.0, 0.0, 1.0);
+        } else if (!strcmp(key, "repeat_delay")) {
+            double delay = clampd(atoi(value), 150.0, 700.0);
+            g_ui.sliders[SL_DELAY] = clampd((delay - 150.0) / 550.0, 0.0, 1.0);
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+/* Ask jtlabwc to re-read its configuration files.  A missing compositor is
+ * not an error: the settings stay on disk and are picked up at the next
+ * session start. */
+static void
+jtlabwc_reload(void)
+{
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    char path[256];
+    snprintf(path, sizeof path, "%s/jtlabwc-ctl.sock",
+             (rt && *rt) ? rt : "/tmp");
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    if (strlen(path) >= sizeof addr.sun_path)
+        return;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
+        static const char msg[] = "reload\n";
+        (void)!write(fd, msg, sizeof msg - 1);
+    }
+    close(fd);
+}
+
+static void
+input_commit(void)
+{
+    input_save();
+    jtlabwc_reload();
+    ui_toast("Input settings applied");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Keybinding settings                                                */
+/* ------------------------------------------------------------------ */
+
+#define KEYBINDS_FILE "keybinds.conf"
+#define TERMINAL_DEFAULT "footclient"
+
+/* Keep this path and the file format in sync with jtlabwc.c. */
+static void
+keybinds_config_path(char *buf, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(buf, n, "%s/.config/jt/%s", home, KEYBINDS_FILE);
+}
+
+static void
+keybinds_save(void)
+{
+    char path[INPUT_PATH_MAX];
+    keybinds_config_path(path, sizeof path);
+    startup_mkdirs(path);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "# jtsettings keybinding configuration\n");
+    fprintf(f, "# Written by jtsettings, read by jtlabwc.\n");
+    fprintf(f, "terminal=%s\n", g_ui.terminal);
+    fclose(f);
+}
+
+static int
+keybinds_load(void)
+{
+    snprintf(g_ui.terminal, sizeof g_ui.terminal, "%s", TERMINAL_DEFAULT);
+
+    char path[INPUT_PATH_MAX];
+    keybinds_config_path(path, sizeof path);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *s = startup_trim(line);
+        if (!*s || *s == '#') continue;
+
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = startup_trim(s);
+        char *value = startup_trim(eq + 1);
+
+        if (!strcmp(key, "terminal") && *value)
+            snprintf(g_ui.terminal, sizeof g_ui.terminal, "%s", value);
+    }
+    fclose(f);
+    return 1;
+}
+
+static void
+terminal_input_cancel(void)
+{
+    g_ui.terminal_editing = 0;
+    g_ui.terminal_input[0] = '\0';
+}
+
+static void
+terminal_input_commit(void)
+{
+    char *cmd = startup_trim(g_ui.terminal_input);
+    if (*cmd)
+        snprintf(g_ui.terminal, sizeof g_ui.terminal, "%s", cmd);
+    terminal_input_cancel();
+    keybinds_save();
+    jtlabwc_reload();
+    ui_toast("Default terminal saved");
 }
 
 static void
@@ -1807,7 +2251,7 @@ static void page_input(cairo_t *cr)
                      g_ui.toggles[TOG_DRAG], TOG_DRAG);
     paint_toggle_row(cr, lx, cy + 224.0, inner, "Disable while typing",
                      "Ignore taps for a short moment",
-                     g_ui.toggles[TOG_LOCK_SUSPEND], TOG_LOCK_SUSPEND);
+                     g_ui.toggles[TOG_DWT], TOG_DWT);
     paint_toggle_row(cr, lx, cy + 266.0, inner, "Left-handed",
                      "Swap the primary mouse button",
                      g_ui.toggles[TOG_LEFT], TOG_LEFT);
@@ -1819,7 +2263,7 @@ static void page_input(cairo_t *cr)
     text_draw(cr, "Layout", 11.5, 500, 0xD2D2D2, 0.94,
               rx, cy + 44.0, ALIGN_LEFT, 0.1);
     paint_field(cr, rx, cy + 62.0, inner, 32.0,
-                "English (US) · intl", 1);
+                "English (US) · intl", 0);
 
     paint_slider_row(cr, rx, cy + 108.0, inner, "Repeat rate",
                      slider_text(SL_REPEAT, g_ui.sliders[SL_REPEAT],
@@ -1834,29 +2278,40 @@ static void page_input(cairo_t *cr)
 
     text_draw(cr, "Compose key", 11.5, 500, 0xD2D2D2, 0.94,
               rx, cy + 212.0, ALIGN_LEFT, 0.1);
-    paint_field(cr, rx, cy + 230.0, inner, 32.0, "Disabled", 1);
-    text_draw(cr, "Layout changes apply to all keyboards", 8.5, 400,
+    paint_field(cr, rx, cy + 230.0, inner, 32.0, "Disabled", 0);
+    text_draw(cr, "Repeat settings apply to every keyboard", 8.5, 400,
               C_FAINT, 0.8, rx, cy + 272.0, ALIGN_LEFT, 0.1);
 
     paint_card(cr, CONTENT_X, gy, CONTENT_W, 104.0);
-    text_draw(cr, "Touchpad gestures", 12.0, 600, 0xE8E8E8, 0.95,
+    text_draw(cr, "Pointer options", 12.0, 600, 0xE8E8E8, 0.95,
               CONTENT_X + 18.0, gy + 16.0, ALIGN_LEFT, 0.1);
-    text_draw(cr, "Scroll method", 9.5, 500, C_DIM, 0.85,
-              CONTENT_X + 18.0, gy + 42.0, ALIGN_LEFT, 0.2);
 
-    static const char *const scrolls[] = { "Two finger", "Edge", "Button" };
-    paint_segment(cr, CONTENT_X + 18.0, gy + 58.0, inner, 30.0,
+    double bw = (CONTENT_W - 36.0 - 40.0) / 3.0;
+    double bx1 = CONTENT_X + 18.0;
+    double bx2 = bx1 + bw + 20.0;
+    double bx3 = bx2 + bw + 20.0;
+
+    text_draw(cr, "Scroll method", 9.5, 500, C_DIM, 0.85,
+              bx1, gy + 42.0, ALIGN_LEFT, 0.2);
+    static const char *const scrolls[] = { "2 finger", "Edge", "Button" };
+    paint_segment(cr, bx1, gy + 58.0, bw, 30.0,
                   scrolls, 3, g_ui.segments[SEG_SCROLL], SEG_SCROLL);
 
-    paint_toggle_row(cr, col2, gy + 24.0, inner,
-                     "Scroll momentum",
-                     "Keep gliding after the fingers lift",
-                     g_ui.toggles[TOG_MOMENTUM], TOG_MOMENTUM);
+    text_draw(cr, "Acceleration", 9.5, 500, C_DIM, 0.85,
+              bx2, gy + 42.0, ALIGN_LEFT, 0.2);
+    static const char *const accels[] = { "Adaptive", "Flat" };
+    paint_segment(cr, bx2, gy + 58.0, bw, 30.0,
+                  accels, 2, g_ui.segments[SEG_ACCEL], SEG_ACCEL);
+
+    paint_toggle_row(cr, bx3, gy + 24.0, bw,
+                     "Middle click",
+                     "Press both buttons",
+                     g_ui.toggles[TOG_MIDDLE], TOG_MIDDLE);
 
     text_wrap(cr,
-        "Input settings are a preview. A finished app would talk to the "
-        "compositor's input configuration and store the result in "
-        "~/.config/labwc/rc.xml.",
+        "Pointer, acceleration and keyboard repeat settings are saved to "
+        "~/.config/jt/input.conf and applied by jtlabwc immediately. "
+        "Layout and compose key are display-only for now.",
         8.8, 400, C_FAINT, 0.8, CONTENT_X, WIN_H - 156.0, CONTENT_W, 2);
 }
 
@@ -2794,8 +3249,11 @@ static void ui_activate(App *a, int idx)
         }
         break;
     case HIT_TOGGLE:
-        if (h->a >= 0 && h->a < TOG_COUNT)
+        if (h->a >= 0 && h->a < TOG_COUNT) {
             g_ui.toggles[h->a] = !g_ui.toggles[h->a];
+            if (input_toggle(h->a))
+                input_commit();
+        }
         break;
     case HIT_START_TOGGLE:
         if (h->a >= 0 && h->a < g_startup_count) {
@@ -2807,12 +3265,26 @@ static void ui_activate(App *a, int idx)
         }
         break;
     case HIT_SEGMENT:
-        if (h->a >= 0 && h->a < SEG_COUNT)
+        if (h->a >= 0 && h->a < SEG_COUNT) {
             g_ui.segments[h->a] = h->b;
+            if (h->a == SEG_KB_FILTER) {
+                g_ui.kb_scroll = 0.0;
+                g_ui.hover = -1;
+            } else if (h->a == SEG_SCROLL || h->a == SEG_ACCEL) {
+                input_commit();
+            }
+        }
         break;
     case HIT_ROW:
         if (g_ui.page >= 0 && g_ui.page < PAGE_COUNT)
             g_ui.selected[g_ui.page] = h->a;
+        break;
+    case HIT_TERM_FIELD:
+        if (!g_ui.terminal_editing) {
+            g_ui.terminal_editing = 1;
+            snprintf(g_ui.terminal_input, sizeof g_ui.terminal_input,
+                     "%s", g_ui.terminal);
+        }
         break;
     case HIT_BUTTON:
         if (h->a == BTN_START_ADD) {
@@ -2831,9 +3303,6 @@ static void ui_activate(App *a, int idx)
             break;
         }
         switch (h->a) {
-        case BTN_ADD_BINDING:
-            ui_toast("Preview only — keybindings are not saved");
-            break;
         case BTN_NEW_RULE:
             ui_toast("Preview only — window rules are not saved");
             break;
@@ -2898,6 +3367,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     g_ui.pointer_y = -1;
     g_ui.hover = -1;
     g_ui.pressed = -1;
+    g_ui.kb_drag = 0;
     a->dirty = 1;
     update_cursor(a);
 }
@@ -2909,6 +3379,19 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
     App *a = data;
     g_ui.pointer_x = wl_fixed_to_double(sx);
     g_ui.pointer_y = wl_fixed_to_double(sy);
+
+    if (g_ui.kb_drag) {
+        double delta = g_ui.kb_drag_y - g_ui.pointer_y;
+        if (fabs(delta) > 3.0)
+            g_ui.kb_drag_moved = 1;
+        g_ui.kb_scroll = clampd(g_ui.kb_drag_scroll + delta,
+                                0.0, kb_max_scroll());
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
     g_ui.hover = hit_at(g_ui.pointer_x, g_ui.pointer_y);
 
     if (g_ui.pressed >= 0 && g_ui.pressed < g_hit_count &&
@@ -2936,6 +3419,18 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     int idx = hit_at(x, y);
 
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (g_ui.page == PAGE_KEYBINDINGS) {
+            double ty, th, view_h;
+            kb_geom(&ty, &th, &view_h);
+            (void)view_h;
+            if (x >= CONTENT_X && x <= CONTENT_X + CONTENT_W &&
+                y >= ty && y <= ty + th) {
+                g_ui.kb_drag = 1;
+                g_ui.kb_drag_moved = 0;
+                g_ui.kb_drag_y = y;
+                g_ui.kb_drag_scroll = g_ui.kb_scroll;
+            }
+        }
         g_ui.pressed = idx;
         g_ui.hover = idx;
         if (idx >= 0 && g_hits[idx].kind == HIT_SLIDER)
@@ -2943,15 +3438,22 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     } else {
         int kind = (idx >= 0) ? g_hits[idx].kind : HIT_NONE;
         int pressed = g_ui.pressed;
-        if (idx >= 0 && idx == pressed && kind != HIT_SLIDER)
+        int was_drag = g_ui.kb_drag && g_ui.kb_drag_moved;
+        g_ui.kb_drag = 0;
+        if (idx >= 0 && idx == pressed && kind != HIT_SLIDER && !was_drag)
             ui_activate(a, idx);
-        /* Persist the autostart delay once the drag ends rather than on
-         * every motion event. */
+        /* Persist sliders once the drag ends rather than on every motion
+         * event. */
         if (pressed >= 0 && pressed < g_hit_count &&
-            g_hits[pressed].kind == HIT_SLIDER &&
-            g_hits[pressed].a == SL_START_DELAY) {
-            startup_save();
-            ui_toast("Autostart delay saved");
+            g_hits[pressed].kind == HIT_SLIDER) {
+            if (g_hits[pressed].a == SL_START_DELAY) {
+                startup_save();
+                ui_toast("Autostart delay saved");
+            } else if (g_hits[pressed].a == SL_POINTER ||
+                       g_hits[pressed].a == SL_REPEAT ||
+                       g_hits[pressed].a == SL_DELAY) {
+                input_commit();
+            }
         }
         g_ui.pressed = -1;
         g_ui.hover = (kind == HIT_NAV) ? -1 : hit_at(x, y);
@@ -2963,7 +3465,29 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
 static void pointer_axis(void *data, struct wl_pointer *pointer,
                          uint32_t time, uint32_t axis, wl_fixed_t value)
 {
-    (void)data; (void)pointer; (void)time; (void)axis; (void)value;
+    (void)pointer; (void)time;
+    App *a = data;
+
+    if (g_ui.page != PAGE_KEYBINDINGS ||
+        axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+        return;
+
+    double ty, th, view_h;
+    kb_geom(&ty, &th, &view_h);
+    (void)view_h;
+    if (g_ui.pointer_x < CONTENT_X ||
+        g_ui.pointer_x > CONTENT_X + CONTENT_W ||
+        g_ui.pointer_y < ty || g_ui.pointer_y > ty + th)
+        return;
+
+    double max_scroll = kb_max_scroll();
+    if (max_scroll <= 0.0)
+        return;
+
+    double next = g_ui.kb_scroll + wl_fixed_to_double(value) * 2.0;
+    g_ui.kb_scroll = clampd(next, 0.0, max_scroll);
+    g_ui.hover = -1;
+    a->dirty = 1;
 }
 
 static void pointer_frame(void *data, struct wl_pointer *pointer)
@@ -3050,6 +3574,42 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard,
     (void)data; (void)keyboard; (void)serial; (void)surface;
 }
 
+/* Shared single-line text editing.  Returns 0 if the key was not consumed,
+ * 1 if it edited the buffer, 2 for Enter and 3 for Escape. */
+static int
+text_input_key(App *a, uint32_t key, xkb_keysym_t sym, char *buf, size_t n)
+{
+    if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter)
+        return 2;
+    if (sym == XKB_KEY_Escape)
+        return 3;
+    if (sym == XKB_KEY_BackSpace) {
+        size_t len = strlen(buf);
+        if (len > 0)
+            buf[len - 1] = '\0';
+        return 1;
+    }
+    if (sym == XKB_KEY_Delete) {
+        buf[0] = '\0';
+        return 1;
+    }
+
+    char tmp[16];
+    int got = xkb_state_key_get_utf8(a->xkb_state, key + 8, tmp, sizeof tmp);
+    if (got > 0) {
+        size_t len = strlen(buf);
+        for (int i = 0; i < got; i++) {
+            unsigned char c = (unsigned char)tmp[i];
+            if (c < 0x20 || c == 0x7F)
+                continue;
+            if (len + 1 < n)
+                buf[len++] = (char)c;
+        }
+        buf[len] = '\0';
+    }
+    return 1;
+}
+
 static void keyboard_key(void *data, struct wl_keyboard *keyboard,
                          uint32_t serial, uint32_t time,
                          uint32_t key, uint32_t state)
@@ -3065,39 +3625,23 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
 
     /* The Add application field owns the keyboard while it is open. */
     if (g_ui.page == PAGE_STARTUP && g_ui.startup_adding) {
-        if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+        int r = text_input_key(a, key, sym, g_ui.startup_input,
+                               sizeof g_ui.startup_input);
+        if (r == 2)
             startup_input_commit();
-            return;
-        }
-        if (sym == XKB_KEY_Escape) {
+        else if (r == 3)
             startup_input_cancel();
-            return;
-        }
-        if (sym == XKB_KEY_BackSpace) {
-            size_t len = strlen(g_ui.startup_input);
-            if (len > 0)
-                g_ui.startup_input[len - 1] = '\0';
-            return;
-        }
-        if (sym == XKB_KEY_Delete) {
-            g_ui.startup_input[0] = '\0';
-            return;
-        }
+        return;
+    }
 
-        char buf[16];
-        int n = xkb_state_key_get_utf8(a->xkb_state, key + 8,
-                                       buf, sizeof buf);
-        if (n > 0) {
-            size_t len = strlen(g_ui.startup_input);
-            for (int i = 0; i < n; i++) {
-                unsigned char c = (unsigned char)buf[i];
-                if (c < 0x20 || c == 0x7F)
-                    continue;
-                if (len + 1 < sizeof g_ui.startup_input)
-                    g_ui.startup_input[len++] = (char)c;
-            }
-            g_ui.startup_input[len] = '\0';
-        }
+    /* The default terminal field owns the keyboard while it is open. */
+    if (g_ui.page == PAGE_KEYBINDINGS && g_ui.terminal_editing) {
+        int r = text_input_key(a, key, sym, g_ui.terminal_input,
+                               sizeof g_ui.terminal_input);
+        if (r == 2)
+            terminal_input_commit();
+        else if (r == 3)
+            terminal_input_cancel();
         return;
     }
 
@@ -3809,7 +4353,7 @@ int main(int argc, char **argv)
         double now = mono_sec();
         g_ui.t = now - a.t0;
 
-        int animating = g_ui.startup_adding;
+        int animating = g_ui.startup_adding || g_ui.terminal_editing;
         if (!animating && g_ui.toast[0]) {
             double age = now - g_ui.toast_t;
             if (age >= 0.0 && age < 3.0)
