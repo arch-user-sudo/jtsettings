@@ -4,6 +4,9 @@
  *   jtsettingsctl accent '#RRGGBB'   change the accent live
  *   jtsettingsctl '#RRGGBB'          shorthand for the same
  *   jtsettingsctl page keybindings   switch pages
+ *   jtsettingsctl apply              apply pending display changes
+ *   jtsettingsctl reset              discard pending display changes
+ *   jtsettingsctl dump               print detected outputs to stderr
  *   jtsettingsctl quit               exit the window
  */
 #include <stdio.h>
@@ -30,7 +33,8 @@ main(int argc, char **argv)
 
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s accent '#RRGGBB' | page NAME | quit\n", argv[0]);
+            "usage: %s accent '#RRGGBB' | page NAME | apply | reset | "
+            "dump | quit\n", argv[0]);
         return 2;
     }
 
@@ -38,6 +42,9 @@ main(int argc, char **argv)
         snprintf(line, sizeof(line), "accent %s\n", argv[2]);
     else if (!strcmp(argv[1], "page") && argc >= 3)
         snprintf(line, sizeof(line), "page %s\n", argv[2]);
+    else if (!strcmp(argv[1], "apply") || !strcmp(argv[1], "reset") ||
+             !strcmp(argv[1], "dump"))
+        snprintf(line, sizeof(line), "%s\n", argv[1]);
     else if (!strcmp(argv[1], "quit"))
         snprintf(line, sizeof(line), "quit\n");
     else if (argv[1][0] == '#')

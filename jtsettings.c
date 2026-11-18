@@ -36,6 +36,7 @@
 #include "xdg-decoration-client-protocol.h"
 #include "xdg-toplevel-icon-client-protocol.h"
 #include "cursor-shape-client-protocol.h"
+#include "wlr-output-management-unstable-v1-client-protocol.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -455,7 +456,14 @@ enum {
     HIT_ROW,
     HIT_BUTTON,
     HIT_START_TOGGLE,
-    HIT_TERM_FIELD
+    HIT_TERM_FIELD,
+    HIT_DISP_RES,
+    HIT_DISP_REFRESH,
+    HIT_DISP_SCALE,
+    HIT_DISP_ORIENT,
+    HIT_DISP_ENABLE,
+    HIT_DISP_PRIMARY,
+    HIT_DISP_MODE
 };
 
 enum {
@@ -466,7 +474,12 @@ enum {
     BTN_REBOOT,
     BTN_SHUTDOWN,
     BTN_START_ADD,
-    BTN_START_REMOVE_FIRST   /* + row index */
+    BTN_START_REMOVE_FIRST,   /* + row index */
+    BTN_POSITION,
+    BTN_POS_DONE,
+    BTN_DISPLAYS_APPLY,
+    BTN_DISPLAYS_RESET,
+    BTN_MODE_CLOSE
 };
 
 typedef struct {
@@ -501,9 +514,72 @@ typedef struct {
     double kb_drag_scroll;
     char toast[96];
     double toast_t;
+    int pos_editor_open;
+    int pos_layout_valid;
+    int mode_picker_open;
+    int mode_picker_head;
+    int disp_scroll;
+    int disp_drag;
+    double disp_drag_ox;
+    double disp_drag_oy;
+    double pos_scale;
+    double pos_offx;
+    double pos_offy;
 } Ui;
 
 static Ui g_ui;
+
+/* ------------------------------------------------------------------ */
+/*  Output management                                                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct App App;
+
+#define MAX_HEADS 8
+#define MAX_MODES 64
+#define MAX_RESOLUTIONS 24
+
+typedef struct {
+    struct zwlr_output_mode_v1 *obj;
+    int32_t width, height, refresh;  /* refresh in mHz */
+    int preferred;
+    int available;
+} HeadMode;
+
+typedef struct {
+    int used;
+    struct zwlr_output_head_v1 *head;
+    char name[64];
+    char description[160];
+    char make[64];
+    char model[64];
+    int32_t phys_w, phys_h;
+    int enabled;
+    int32_t x, y;
+    int32_t transform;
+    double scale;
+    int32_t cur_w, cur_h, cur_refresh;
+    struct zwlr_output_mode_v1 *current_mode;
+    HeadMode modes[MAX_MODES];
+    int mode_count;
+
+    /* Pending configuration, edited in the UI and applied as one config. */
+    int p_enabled;
+    int p_mode;             /* index into modes, -1 when unknown */
+    double p_scale;
+    int32_t p_transform;
+    int32_t p_x, p_y;
+    int pending_ready;
+    int dirty;
+} Head;
+
+typedef struct {
+    int32_t w, h;
+} Resolution;
+
+static Head g_heads[MAX_HEADS];
+static App *g_app;
+static int g_output_manager_available;
 
 /* Defined below, once the startup list is in scope. */
 static int startup_load(void);
@@ -539,6 +615,17 @@ static void ui_init(void)
     g_ui.pointer_x = -1;
     g_ui.pointer_y = -1;
     g_ui.toast_t = -1.0;
+    g_ui.pos_editor_open = 0;
+    g_ui.pos_layout_valid = 0;
+    g_ui.mode_picker_open = 0;
+    g_ui.mode_picker_head = -1;
+    g_ui.disp_scroll = 0;
+    g_ui.disp_drag = -1;
+    g_ui.disp_drag_ox = 0.0;
+    g_ui.disp_drag_oy = 0.0;
+    g_ui.pos_scale = 0.2;
+    g_ui.pos_offx = 0.0;
+    g_ui.pos_offy = 0.0;
 
     g_ui.toggles[TOG_NATURAL] = 1;
     g_ui.toggles[TOG_TAP] = 1;
@@ -587,9 +674,291 @@ static void ui_init(void)
     (void)keybinds_load();
 }
 
+/* ---- display helpers --------------------------------------------- */
+
+static Head *head_get(int idx)
+{
+    if (idx < 0 || idx >= MAX_HEADS || !g_heads[idx].used)
+        return NULL;
+    return &g_heads[idx];
+}
+
+static int head_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_HEADS; i++)
+        if (g_heads[i].used)
+            n++;
+    return n;
+}
+
+static int head_enabled_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_HEADS; i++)
+        if (g_heads[i].used && g_heads[i].p_enabled)
+            n++;
+    return n;
+}
+
+static int head_mode_valid(const Head *h)
+{
+    return h->p_mode >= 0 && h->p_mode < h->mode_count &&
+           h->modes[h->p_mode].available &&
+           h->modes[h->p_mode].width > 0;
+}
+
+static void head_logical_size(const Head *h, double *w, double *hgt)
+{
+    double mw = h->cur_w > 0 ? (double)h->cur_w : 1920.0;
+    double mh = h->cur_h > 0 ? (double)h->cur_h : 1080.0;
+    if (head_mode_valid(h)) {
+        mw = (double)h->modes[h->p_mode].width;
+        mh = (double)h->modes[h->p_mode].height;
+    }
+    double s = h->p_scale > 0.0 ? h->p_scale : 1.0;
+    mw /= s;
+    mh /= s;
+    if (h->p_transform == 1 || h->p_transform == 3) {
+        double t = mw;
+        mw = mh;
+        mh = t;
+    }
+    *w = mw;
+    *hgt = mh;
+}
+
+static int head_resolutions(const Head *h, Resolution *out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < h->mode_count && n < max; i++) {
+        const HeadMode *m = &h->modes[i];
+        if (!m->available || m->width <= 0 || m->height <= 0)
+            continue;
+        int seen = 0;
+        for (int j = 0; j < n; j++) {
+            if (out[j].w == m->width && out[j].h == m->height) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            out[n].w = m->width;
+            out[n].h = m->height;
+            n++;
+        }
+    }
+    return n;
+}
+
+static int head_refreshes(const Head *h, int32_t w, int32_t hgt,
+                          int32_t *out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < h->mode_count && n < max; i++) {
+        const HeadMode *m = &h->modes[i];
+        if (!m->available || m->width != w || m->height != hgt)
+            continue;
+        int seen = 0;
+        for (int j = 0; j < n; j++) {
+            if (out[j] == m->refresh) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen)
+            out[n++] = m->refresh;
+    }
+    /* Lowest to highest reads better in the segmented control. */
+    for (int i = 1; i < n; i++) {
+        int32_t v = out[i];
+        int j = i - 1;
+        while (j >= 0 && out[j] > v) {
+            out[j + 1] = out[j];
+            j--;
+        }
+        out[j + 1] = v;
+    }
+    return n;
+}
+
+static int head_mode_index(const Head *h, int32_t w, int32_t hgt,
+                           int32_t refresh)
+{
+    for (int i = 0; i < h->mode_count; i++) {
+        const HeadMode *m = &h->modes[i];
+        if (m->available && m->width == w && m->height == hgt &&
+            m->refresh == refresh)
+            return i;
+    }
+    return -1;
+}
+
+static void head_choose_resolution(Head *h, int32_t w, int32_t hgt)
+{
+    int32_t want = h->cur_refresh;
+    if (head_mode_valid(h))
+        want = h->modes[h->p_mode].refresh;
+
+    int pick = -1;
+    int32_t best_refresh = -1;
+    for (int i = 0; i < h->mode_count; i++) {
+        const HeadMode *m = &h->modes[i];
+        if (!m->available || m->width != w || m->height != hgt)
+            continue;
+        if (m->refresh == want) {
+            pick = i;
+            break;
+        }
+        if (m->refresh > best_refresh) {
+            best_refresh = m->refresh;
+            pick = i;
+        }
+    }
+    if (pick >= 0) {
+        h->p_mode = pick;
+        h->dirty = 1;
+    }
+}
+
+static void head_choose_refresh(Head *h, int32_t w, int32_t hgt,
+                                int32_t refresh)
+{
+    int idx = head_mode_index(h, w, hgt, refresh);
+    if (idx >= 0) {
+        h->p_mode = idx;
+        h->dirty = 1;
+    }
+}
+
+static const double DISP_SCALES[] = { 1.0, 1.25, 1.5, 2.0 };
+static const char *const DISP_SCALE_LABELS[] = {
+    "100%", "125%", "150%", "200%"
+};
+#define DISP_SCALE_COUNT ((int)(sizeof DISP_SCALES / sizeof DISP_SCALES[0]))
+
+static int head_scale_index(const Head *h)
+{
+    int best = 0;
+    double dist = 1e9;
+    for (int i = 0; i < DISP_SCALE_COUNT; i++) {
+        double d = fabs(h->p_scale - DISP_SCALES[i]);
+        if (d < dist) {
+            dist = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static int head_orient_index(const Head *h)
+{
+    return (h->p_transform == 1 || h->p_transform == 3) ? 1 : 0;
+}
+
+static int head_is_primary(int idx)
+{
+    Head *h = head_get(idx);
+    return h && h->p_enabled && h->p_x == 0 && h->p_y == 0;
+}
+
+static void displays_sync_pending(Head *h)
+{
+    h->p_enabled = h->enabled;
+    h->p_scale = h->scale > 0.0 ? h->scale : 1.0;
+    h->p_transform = h->transform;
+    h->p_x = h->x;
+    h->p_y = h->y;
+    h->p_mode = -1;
+    for (int i = 0; i < h->mode_count; i++) {
+        const HeadMode *m = &h->modes[i];
+        if (m->available && m->width == h->cur_w &&
+            m->height == h->cur_h && m->refresh == h->cur_refresh) {
+            h->p_mode = i;
+            break;
+        }
+    }
+    h->dirty = 0;
+    h->pending_ready = 1;
+}
+
+static void displays_sync_all(void)
+{
+    for (int i = 0; i < MAX_HEADS; i++)
+        if (g_heads[i].used)
+            displays_sync_pending(&g_heads[i]);
+}
+
+static void displays_make_primary(int idx)
+{
+    Head *h = head_get(idx);
+    if (!h)
+        return;
+    if (!h->p_enabled) {
+        h->p_enabled = 1;
+        h->dirty = 1;
+    }
+    if (h->p_x == 0 && h->p_y == 0)
+        return;
+
+    int32_t old_x = h->p_x, old_y = h->p_y;
+    for (int i = 0; i < MAX_HEADS; i++) {
+        Head *o = &g_heads[i];
+        if (i == idx || !o->used || !o->p_enabled)
+            continue;
+        if (o->p_x == 0 && o->p_y == 0) {
+            o->p_x = old_x;
+            o->p_y = old_y;
+            o->dirty = 1;
+            break;
+        }
+    }
+    h->p_x = 0;
+    h->p_y = 0;
+    h->dirty = 1;
+}
+
+static void displays_toggle_enabled(int idx)
+{
+    Head *h = head_get(idx);
+    if (!h)
+        return;
+    if (h->p_enabled && head_enabled_count() <= 1) {
+        ui_toast("At least one display must stay enabled");
+        return;
+    }
+    h->p_enabled = !h->p_enabled;
+    h->dirty = 1;
+
+    if (h->p_enabled && !head_mode_valid(h)) {
+        int pick = -1;
+        for (int i = 0; i < h->mode_count; i++) {
+            const HeadMode *m = &h->modes[i];
+            if (!m->available || m->width <= 0)
+                continue;
+            if (m->preferred) {
+                pick = i;
+                break;
+            }
+            if (pick < 0)
+                pick = i;
+        }
+        if (pick >= 0)
+            h->p_mode = pick;
+    }
+}
+
+
 static int add_hit(int kind, int a, int b,
                    double x, double y, double w, double h)
 {
+    /* Display cards scroll inside a clipped viewport.  Do not register
+     * controls that are scrolled underneath the header or action row. */
+    if (kind >= HIT_DISP_RES && kind <= HIT_DISP_MODE &&
+        !g_ui.mode_picker_open &&
+        (y < 118.0 || y + h > WIN_H - 160.0))
+        return -1;
+
     if (g_hit_count >= MAX_HITS)
         return -1;
     Hit *hit = &g_hits[g_hit_count];
@@ -714,6 +1083,48 @@ static void paint_slider_row(cairo_t *cr, double x, double y, double w,
     cairo_fill(cr);
 }
 
+static void paint_segment_ex(cairo_t *cr, double x, double y, double w,
+                             double h, const char *const *items, int count,
+                             int sel, int kind, int a)
+{
+    if (count <= 0)
+        return;
+
+    rgba(cr, C_TRACK, 0.95);
+    rounded_rect(cr, x, y, w, h, h / 2.0);
+    cairo_fill(cr);
+    rgba(cr, C_BORDER, 0.40);
+    cairo_set_line_width(cr, 1.0);
+    rounded_rect(cr, x + 0.5, y + 0.5, w - 1.0, h - 1.0, h / 2.0 - 0.5);
+    cairo_stroke(cr);
+
+    double iw = w / (double)count;
+    for (int i = 0; i < count; i++) {
+        double ix = x + i * iw;
+        int idx = add_hit(kind, a, i, ix, y, iw, h);
+        int on = sel == i;
+        int hot = hit_hover(idx);
+
+        if (on) {
+            rgba(cr, C_ACCENT, 0.92);
+            rounded_rect(cr, ix + 2.0, y + 2.0, iw - 4.0, h - 4.0,
+                         (h - 4.0) / 2.0);
+            cairo_fill(cr);
+        } else if (hot) {
+            rgba(cr, C_FG, 0.045);
+            rounded_rect(cr, ix + 2.0, y + 2.0, iw - 4.0, h - 4.0,
+                         (h - 4.0) / 2.0);
+            cairo_fill(cr);
+        }
+
+        text_draw(cr, items[i], 9.5, 600,
+                  on ? C_ON_ACCENT : (hot ? C_FG : C_DIM),
+                  on ? 1.0 : 0.86, ix + iw / 2.0, y + (h - 12.0) / 2.0,
+                  ALIGN_CENTER, 0.2);
+    }
+}
+
+
 static void paint_segment(cairo_t *cr, double x, double y, double w,
                           double h, const char *const *items, int count,
                           int sel, int seg_id)
@@ -751,6 +1162,35 @@ static void paint_segment(cairo_t *cr, double x, double y, double w,
                   ALIGN_CENTER, 0.2);
     }
 }
+
+static void paint_button_ex(cairo_t *cr, double x, double y, double w,
+                            double h, const char *label, int primary,
+                            int kind, int a, int b)
+{
+    int idx = add_hit(kind, a, b, x, y, w, h);
+    int hot = hit_hover(idx);
+    int down = idx >= 0 && idx == g_ui.pressed;
+
+    if (primary) {
+        unsigned fill = down ? C_ACCENT_LO : (hot ? C_ACCENT_HI : C_ACCENT);
+        rgba(cr, fill, 1.0);
+        rounded_rect(cr, x, y, w, h, 8.0);
+        cairo_fill(cr);
+        text_draw(cr, label, 11.0, 600, C_ON_ACCENT, 1.0,
+                  x + w / 2.0, y + (h - 14.0) / 2.0, ALIGN_CENTER, 0.25);
+    } else {
+        rgba(cr, C_FG, down ? 0.10 : (hot ? 0.065 : 0.035));
+        rounded_rect(cr, x, y, w, h, 8.0);
+        cairo_fill(cr);
+        rgba(cr, C_BORDER, hot ? 0.85 : 0.55);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, x + 0.5, y + 0.5, w - 1.0, h - 1.0, 7.5);
+        cairo_stroke(cr);
+        text_draw(cr, label, 11.0, 600, hot ? C_FG : C_DIM, 0.95,
+                  x + w / 2.0, y + (h - 14.0) / 2.0, ALIGN_CENTER, 0.25);
+    }
+}
+
 
 static void paint_button(cairo_t *cr, double x, double y, double w, double h,
                          const char *label, int primary, int button_id)
@@ -1195,6 +1635,239 @@ static void paint_header(cairo_t *cr)
     text_draw(cr, "JT · Wayland", 9.0, 400, C_FAINT, 0.85,
               WIN_W - 36.0, 51.0, ALIGN_RIGHT, 0.2);
 }
+
+static void pos_canvas_bounds(double *cx, double *cy,
+                              double *cw, double *ch)
+{
+    double pw = 700.0, ph = 420.0;
+    double px = (WIN_W - pw) / 2.0;
+    double py = (WIN_H - ph) / 2.0;
+    *cx = px + 24.0;
+    *cy = py + 70.0;
+    *cw = pw - 48.0;
+    *ch = ph - 140.0;
+}
+
+static int head_in_arrangement(int idx)
+{
+    Head *h = head_get(idx);
+    if (!h)
+        return 0;
+    return h->p_enabled || head_enabled_count() == 0;
+}
+
+static void pos_compute_layout(void)
+{
+    double cx, cy, cw, ch;
+    pos_canvas_bounds(&cx, &cy, &cw, &ch);
+
+    double minx = 0.0, miny = 0.0, maxx = 0.0, maxy = 0.0;
+    int first = 1;
+    for (int i = 0; i < MAX_HEADS; i++) {
+        if (!head_in_arrangement(i))
+            continue;
+        Head *h = &g_heads[i];
+        double lw, lh;
+        head_logical_size(h, &lw, &lh);
+        if (first) {
+            minx = h->p_x;
+            miny = h->p_y;
+            maxx = h->p_x + lw;
+            maxy = h->p_y + lh;
+            first = 0;
+        } else {
+            if (h->p_x < minx) minx = h->p_x;
+            if (h->p_y < miny) miny = h->p_y;
+            if (h->p_x + lw > maxx) maxx = h->p_x + lw;
+            if (h->p_y + lh > maxy) maxy = h->p_y + lh;
+        }
+    }
+    if (first) {
+        minx = 0.0; miny = 0.0; maxx = 1920.0; maxy = 1080.0;
+    }
+
+    double spanx = maxx - minx;
+    double spany = maxy - miny;
+    if (spanx < 1.0) spanx = 1.0;
+    if (spany < 1.0) spany = 1.0;
+
+    double avail_w = cw - 80.0;
+    double avail_h = ch - 80.0;
+    double s = avail_w / spanx;
+    if (avail_h / spany < s)
+        s = avail_h / spany;
+    s = clampd(s, 0.02, 0.35);
+
+    g_ui.pos_scale = s;
+    g_ui.pos_offx = cx + 40.0 + (avail_w - spanx * s) / 2.0 - minx * s;
+    g_ui.pos_offy = cy + 40.0 + (avail_h - spany * s) / 2.0 - miny * s;
+}
+
+static void paint_position_editor(cairo_t *cr)
+{
+    if (!g_ui.pos_editor_open)
+        return;
+
+    /* Compute the fit once per editor session.  Recomputing on every
+     * frame would re-centre the boxes after each drag and make them
+     * appear to snap back. */
+    if (!g_ui.pos_layout_valid) {
+        pos_compute_layout();
+        g_ui.pos_layout_valid = 1;
+    }
+
+    rgba(cr, 0x000000, 0.55);
+    cairo_rectangle(cr, 0, 0, WIN_W, WIN_H);
+    cairo_fill(cr);
+
+    double pw = 700.0, ph = 420.0;
+    double px = (WIN_W - pw) / 2.0;
+    double py = (WIN_H - ph) / 2.0;
+
+    paint_card(cr, px, py, pw, ph);
+
+    text_draw(cr, "Arrange displays", 18.0, 700, C_FG, 0.98,
+              px + 24.0, py + 20.0, ALIGN_LEFT, 0.0);
+    text_draw(cr, "Drag the displays to match your physical setup", 9.5, 400,
+              C_DIM, 0.8, px + 24.0, py + 48.0, ALIGN_LEFT, 0.1);
+
+    double cx, cy, cw, ch;
+    pos_canvas_bounds(&cx, &cy, &cw, &ch);
+    rgba(cr, C_TRACK, 0.6);
+    rounded_rect(cr, cx, cy, cw, ch, 8.0);
+    cairo_fill(cr);
+    rgba(cr, C_BORDER, 0.5);
+    cairo_set_line_width(cr, 1.0);
+    rounded_rect(cr, cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0, 7.5);
+    cairo_stroke(cr);
+
+    int any = 0;
+    for (int i = 0; i < MAX_HEADS; i++) {
+        if (!head_in_arrangement(i))
+            continue;
+        any = 1;
+        Head *h = &g_heads[i];
+        double lw, lh;
+        head_logical_size(h, &lw, &lh);
+        double rx = g_ui.pos_offx + h->p_x * g_ui.pos_scale;
+        double ry = g_ui.pos_offy + h->p_y * g_ui.pos_scale;
+        double rw = lw * g_ui.pos_scale;
+        double rh = lh * g_ui.pos_scale;
+        if (rw < 28.0) rw = 28.0;
+        if (rh < 20.0) rh = 20.0;
+
+        int is_drag = (g_ui.disp_drag == i);
+        int enabled = h->p_enabled;
+        rgba(cr, is_drag ? C_ACCENT : 0x1A1B1D,
+             is_drag ? 0.28 : (enabled ? 1.0 : 0.5));
+        rounded_rect(cr, rx, ry, rw, rh, 6.0);
+        cairo_fill(cr);
+        rgba(cr, is_drag ? C_ACCENT : C_BORDER,
+             is_drag ? 0.95 : (enabled ? 0.6 : 0.3));
+        cairo_set_line_width(cr, is_drag ? 2.0 : 1.0);
+        rounded_rect(cr, rx + 0.5, ry + 0.5, rw - 1.0, rh - 1.0, 5.5);
+        cairo_stroke(cr);
+
+        text_draw(cr, h->name[0] ? h->name : "Output", 11.0, 600,
+                  enabled ? C_FG : C_DIM, enabled ? 0.95 : 0.6,
+                  rx + rw / 2.0, ry + rh / 2.0 - 12.0, ALIGN_CENTER, 0.1);
+        char posbuf[64];
+        snprintf(posbuf, sizeof posbuf, "%d, %d", h->p_x, h->p_y);
+        text_draw(cr, posbuf, 8.5, 400, C_DIM, 0.85,
+                  rx + rw / 2.0, ry + rh / 2.0 + 4.0, ALIGN_CENTER, 0.1);
+    }
+
+    if (!any) {
+        text_draw(cr, "No displays detected", 11.0, 500, C_DIM, 0.9,
+                  cx + cw / 2.0, cy + ch / 2.0 - 6.0, ALIGN_CENTER, 0.2);
+    }
+
+    paint_button(cr, px + pw - 24.0 - 120.0, py + ph - 24.0 - 36.0, 120.0, 36.0,
+                 "Done", 1, BTN_POS_DONE);
+}
+
+static void mode_picker_rect(const Head *h, double *px, double *py,
+                             double *pw, double *ph)
+{
+    Resolution res[MAX_RESOLUTIONS];
+    int rn = head_resolutions(h, res, MAX_RESOLUTIONS);
+    int rows = rn > 10 ? 10 : rn;
+
+    *pw = 460.0;
+    *ph = 104.0 + rows * 34.0 + (rn == 0 ? 46.0 : 0.0) + 52.0;
+    *px = (WIN_W - *pw) / 2.0;
+    *py = (WIN_H - *ph) / 2.0;
+}
+
+static void paint_mode_picker(cairo_t *cr)
+{
+    if (!g_ui.mode_picker_open)
+        return;
+
+    Head *h = head_get(g_ui.mode_picker_head);
+    if (!h) {
+        g_ui.mode_picker_open = 0;
+        return;
+    }
+
+    Resolution res[MAX_RESOLUTIONS];
+    int rn = head_resolutions(h, res, MAX_RESOLUTIONS);
+    int rows = rn > 10 ? 10 : rn;
+
+    double pw, ph, px, py;
+    mode_picker_rect(h, &px, &py, &pw, &ph);
+
+    rgba(cr, 0x000000, 0.55);
+    cairo_rectangle(cr, 0, 0, WIN_W, WIN_H);
+    cairo_fill(cr);
+
+    paint_card(cr, px, py, pw, ph);
+    text_draw(cr, "Resolution", 16.0, 700, C_FG, 0.98,
+              px + 22.0, py + 18.0, ALIGN_LEFT, 0.0);
+    text_draw(cr, h->name[0] ? h->name : "Output", 9.5, 400, C_DIM, 0.8,
+              px + 22.0, py + 44.0, ALIGN_LEFT, 0.1);
+
+    if (rn == 0) {
+        text_draw(cr, "No modes reported by the compositor.", 9.5, 400,
+                  C_DIM, 0.85, px + 22.0, py + 82.0, ALIGN_LEFT, 0.1);
+    }
+
+    int32_t curw = h->cur_w, curh = h->cur_h;
+    if (head_mode_valid(h)) {
+        curw = h->modes[h->p_mode].width;
+        curh = h->modes[h->p_mode].height;
+    }
+
+    for (int i = 0; i < rows; i++) {
+        double ry = py + 76.0 + i * 34.0;
+        int on = (res[i].w == curw && res[i].h == curh);
+        int idx = add_hit(HIT_DISP_MODE, g_ui.mode_picker_head, i,
+                          px + 16.0, ry, pw - 32.0, 28.0);
+        int hot = hit_hover(idx);
+
+        rgba(cr, on ? C_ACCENT : C_TRACK, on ? 0.16 : (hot ? 0.9 : 0.7));
+        rounded_rect(cr, px + 16.0, ry, pw - 32.0, 28.0, 7.0);
+        cairo_fill(cr);
+        rgba(cr, on ? C_ACCENT : C_BORDER, on ? 0.65 : 0.35);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, px + 16.5, ry + 0.5, pw - 33.0, 27.0, 6.5);
+        cairo_stroke(cr);
+
+        char label[48];
+        snprintf(label, sizeof label, "%d × %d", res[i].w, res[i].h);
+        text_draw(cr, label, 10.5, 500, on ? C_ACCENT : C_FG,
+                  on ? 1.0 : 0.92, px + 30.0, ry + 7.0, ALIGN_LEFT, 0.2);
+        if (on) {
+            rgba(cr, C_ACCENT, 0.95);
+            cairo_arc(cr, px + pw - 32.0, ry + 14.0, 4.0, 0.0, 2.0 * PI);
+            cairo_fill(cr);
+        }
+    }
+
+    paint_button(cr, px + pw - 22.0 - 100.0, py + ph - 22.0 - 32.0,
+                 100.0, 32.0, "Cancel", 0, BTN_MODE_CLOSE);
+}
+
 
 static void paint_footer(cairo_t *cr)
 {
@@ -1834,6 +2507,40 @@ input_commit(void)
     ui_toast("Input settings applied");
 }
 
+#define DISPLAYS_FILE "displays.conf"
+static void
+displays_config_path(char *buf, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(buf, n, "%s/.config/jt/%s", home, DISPLAYS_FILE);
+}
+static void
+displays_save(void)
+{
+    char path[256];
+    displays_config_path(path, sizeof path);
+    startup_mkdirs(path);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# jtsettings displays configuration\n");
+    fprintf(f, "# Written by jtsettings, read by jtlabwc.\n");
+    for (int i = 0; i < MAX_HEADS; i++) {
+        const Head *h = &g_heads[i];
+        if (!h->used || !h->name[0])
+            continue;
+        fprintf(f, "output=%s,x=%d,y=%d\n", h->name, h->p_x, h->p_y);
+    }
+    fclose(f);
+}
+static void
+displays_commit(void)
+{
+    /* Configuration is already live through wlr-output-management; the
+     * config file only preserves output positions across restarts. */
+    displays_save();
+}
+
 /* ------------------------------------------------------------------ */
 /*  Keybinding settings                                                */
 /* ------------------------------------------------------------------ */
@@ -1992,6 +2699,31 @@ static void paint_switch(cairo_t *cr, double x, double y, int on,
     cairo_arc(cr, kx, y + th / 2.0, 6.4, 0.0, 2.0 * PI);
     cairo_fill(cr);
 }
+
+static void paint_mini_toggle_ex(cairo_t *cr, double x, double y,
+                                 int on, int kind, int a)
+{
+    double tw = 38.0, th = 20.0;
+    int idx = add_hit(kind, a, 0, x - 4.0, y - 4.0,
+                      tw + 8.0, th + 8.0);
+    int hot = hit_hover(idx);
+
+    rgba(cr, on ? C_ACCENT : C_TRACK, on ? (hot ? 0.95 : 0.85) : 0.9);
+    rounded_rect(cr, x, y, tw, th, th / 2.0);
+    cairo_fill(cr);
+    if (!on) {
+        rgba(cr, C_BORDER, 0.55);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, x + 0.5, y + 0.5, tw - 1.0, th - 1.0,
+                     th / 2.0 - 0.5);
+        cairo_stroke(cr);
+    }
+    double kx = on ? x + tw - th / 2.0 : x + th / 2.0;
+    rgba(cr, on ? C_ON_ACCENT : C_DIM, on ? 1.0 : 0.75);
+    cairo_arc(cr, kx, y + th / 2.0, 6.4, 0.0, 2.0 * PI);
+    cairo_fill(cr);
+}
+
 
 static void paint_mini_toggle(cairo_t *cr, double x, double y,
                               int on, int toggle_id)
@@ -2360,79 +3092,196 @@ static void paint_display_preview(cairo_t *cr, double x, double y,
     }
 }
 
-static void display_card(cairo_t *cr, double y, const char *name,
-                         const char *model, int connected, int refresh_seg,
-                         int scale_seg, int orient_seg, int primary_toggle)
+static const char *head_description(const Head *h, char *buf, size_t n)
 {
+    if (h->description[0])
+        return h->description;
+    if (h->make[0] || h->model[0]) {
+        snprintf(buf, n, "%s%s%s", h->make, h->make[0] && h->model[0] ? " " : "",
+                 h->model);
+        return buf;
+    }
+    return "Unknown display";
+}
+
+static void display_card(cairo_t *cr, int idx, double y)
+{
+    Head *h = &g_heads[idx];
+    int connected = h->p_enabled;
+
     paint_card(cr, CONTENT_X, y, CONTENT_W, 206.0);
     paint_display_preview(cr, CONTENT_X + 18.0, y + 18.0, 196.0, 140.0,
                           connected);
 
     double rx = CONTENT_X + 240.0;
-    text_draw(cr, name, 13.0, 600, connected ? C_FG : C_DIM, 0.96,
+    char descbuf[192];
+    const char *desc = head_description(h, descbuf, sizeof descbuf);
+
+    text_draw(cr, h->name[0] ? h->name : "Output", 13.0, 600,
+              connected ? C_FG : C_DIM, 0.96,
               rx, y + 16.0, ALIGN_LEFT, 0.1);
-    text_draw(cr, model, 9.0, 400, C_DIM, 0.75,
-              rx, y + 36.0, ALIGN_LEFT, 0.1);
+    text_wrap(cr, desc, 9.0, 400, C_DIM, 0.75,
+              rx, y + 36.0, 500.0, 1);
+
+    int32_t pw = h->cur_w, ph = h->cur_h;
+    if (head_mode_valid(h)) {
+        pw = h->modes[h->p_mode].width;
+        ph = h->modes[h->p_mode].height;
+    }
 
     text_draw(cr, "RESOLUTION", 7.8, 600, C_FAINT, 0.9,
               rx, y + 60.0, ALIGN_LEFT, 1.3);
-    paint_field(cr, rx, y + 76.0, 230.0, 30.0,
-                connected ? "2560 × 1440" : "—", 1);
+    int ridx = add_hit(HIT_DISP_RES, idx, 0, rx, y + 76.0, 230.0, 30.0);
+    char resbuf[48];
+    if (pw > 0 && ph > 0)
+        snprintf(resbuf, sizeof resbuf, "%d × %d", pw, ph);
+    else
+        snprintf(resbuf, sizeof resbuf, "—");
+    paint_field(cr, rx, y + 76.0, 230.0, 30.0, resbuf, 1);
+    if (hit_hover(ridx)) {
+        rgba(cr, C_ACCENT, 0.55);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, rx + 0.5, y + 76.5, 229.0, 29.0, 6.5);
+        cairo_stroke(cr);
+    }
 
     text_draw(cr, "REFRESH RATE", 7.8, 600, C_FAINT, 0.9,
               rx + 254.0, y + 60.0, ALIGN_LEFT, 1.3);
-    static const char *const refresh[] = { "60 Hz", "120 Hz", "144 Hz" };
-    paint_segment(cr, rx + 254.0, y + 76.0, 246.0, 30.0,
-                  refresh, 3, g_ui.segments[refresh_seg], refresh_seg);
+    int32_t refreshes[8];
+    int rn = head_refreshes(h, pw, ph, refreshes, 8);
+    if (rn > 4)
+        rn = 4;
+    if (rn > 0) {
+        char rbuf[4][24];
+        const char *ritems[4];
+        int rsel = 0;
+        int32_t chosen = head_mode_valid(h) ? h->modes[h->p_mode].refresh
+                                            : h->cur_refresh;
+        for (int i = 0; i < rn; i++) {
+            double hz = refreshes[i] / 1000.0;
+            snprintf(rbuf[i], sizeof rbuf[i], "%.0f Hz", hz);
+            ritems[i] = rbuf[i];
+            if (refreshes[i] == chosen)
+                rsel = i;
+        }
+        paint_segment_ex(cr, rx + 254.0, y + 76.0, 246.0, 30.0,
+                         ritems, rn, rsel, HIT_DISP_REFRESH, idx);
+    } else {
+        paint_field(cr, rx + 254.0, y + 76.0, 246.0, 30.0, "—", 0);
+    }
 
     text_draw(cr, "ORIENTATION", 7.8, 600, C_FAINT, 0.9,
               rx, y + 118.0, ALIGN_LEFT, 1.3);
     static const char *const orient[] = { "Landscape", "Portrait" };
-    paint_segment(cr, rx, y + 134.0, 230.0, 30.0,
-                  orient, 2, g_ui.segments[orient_seg], orient_seg);
+    paint_segment_ex(cr, rx, y + 134.0, 230.0, 30.0,
+                     orient, 2, head_orient_index(h),
+                     HIT_DISP_ORIENT, idx);
 
     text_draw(cr, "SCALE", 7.8, 600, C_FAINT, 0.9,
               rx + 254.0, y + 118.0, ALIGN_LEFT, 1.3);
-    static const char *const scales[] = { "100%", "125%", "150%" };
-    paint_segment(cr, rx + 254.0, y + 134.0, 246.0, 30.0,
-                  scales, 3, g_ui.segments[scale_seg], scale_seg);
+    paint_segment_ex(cr, rx + 254.0, y + 134.0, 246.0, 30.0,
+                     DISP_SCALE_LABELS, DISP_SCALE_COUNT,
+                     head_scale_index(h), HIT_DISP_SCALE, idx);
 
-    text_draw(cr, "Primary display", 10.0, 500, connected ? 0xD2D2D2 : C_FAINT,
+    text_draw(cr, "Enabled", 10.0, 500, connected ? 0xD2D2D2 : C_FAINT,
               0.9, rx, y + 176.0, ALIGN_LEFT, 0.1);
-    paint_mini_toggle(cr, rx + 230.0, y + 174.0,
-                      g_ui.toggles[primary_toggle], primary_toggle);
+    paint_mini_toggle_ex(cr, rx + 58.0, y + 174.0, h->p_enabled,
+                         HIT_DISP_ENABLE, idx);
 
-    text_draw(cr, connected ? "Connected · DisplayPort" : "Cable unplugged",
-              8.5, 400, connected ? C_GREEN : C_FAINT,
-              connected ? 0.8 : 0.7, CONTENT_X + 18.0, y + 172.0,
-              ALIGN_LEFT, 0.2);
+    paint_button_ex(cr, rx + 380.0, y + 170.0, 110.0, 30.0,
+                    head_is_primary(idx) ? "Primary" : "Make primary",
+                    head_is_primary(idx), HIT_DISP_PRIMARY, idx, 0);
+
+    char status[96];
+    if (connected) {
+        if (pw > 0 && ph > 0 && head_mode_valid(h))
+            snprintf(status, sizeof status, "Connected · %d×%d @ %.0f Hz",
+                     pw, ph, h->modes[h->p_mode].refresh / 1000.0);
+        else
+            snprintf(status, sizeof status, "Connected");
+    } else {
+        snprintf(status, sizeof status, "Disabled");
+    }
+    text_wrap(cr, status, 8.5, 400, connected ? C_GREEN : C_FAINT,
+              connected ? 0.8 : 0.7, CONTENT_X + 18.0, y + 172.0, 196.0, 1);
 }
 
 static void page_displays(cairo_t *cr)
 {
     section_label(cr, "OUTPUTS", CONTENT_X, 102.0);
-    text_draw(cr, "2 outputs · one active", 9.5, 400, C_DIM, 0.75,
+
+    int n = head_count();
+    int active = head_enabled_count();
+    double btn_y = WIN_H - 150.0;
+    double view_top = 118.0;
+    double view_bottom = btn_y - 10.0;
+    int max_scroll = (int)(n * 220.0 - (view_bottom - view_top));
+    if (max_scroll < 0)
+        max_scroll = 0;
+    if (g_ui.disp_scroll > max_scroll)
+        g_ui.disp_scroll = max_scroll;
+    if (g_ui.disp_scroll < 0)
+        g_ui.disp_scroll = 0;
+
+    char summary[96];
+    if (n > 0)
+        snprintf(summary, sizeof summary, "%d output%s · %d active",
+                 n, n == 1 ? "" : "s", active);
+    else
+        snprintf(summary, sizeof summary, "no outputs detected");
+    text_draw(cr, summary, 9.5, 400, C_DIM, 0.75,
               WIN_W - 36.0, 102.0, ALIGN_RIGHT, 0.2);
 
-    double footnote_y = WIN_H - 154.0;
-    double card_h = 206.0;
-    double gap = 14.0 + (WIN_H - DESIGN_H);
-    if (gap < 14.0)
-        gap = 14.0;
+    if (n == 0) {
+        paint_card(cr, CONTENT_X, 122.0, CONTENT_W, 206.0);
+        text_draw(cr, g_output_manager_available
+                       ? "No outputs detected"
+                       : "Output management unavailable",
+                  15.0, 600, C_FG, 0.95,
+                  CONTENT_X + 24.0, 156.0, ALIGN_LEFT, 0.1);
+        text_wrap(cr,
+            g_output_manager_available
+                ? "jtlabwc is not advertising any outputs. Check the "
+                  "connection and make sure the compositor is running."
+                : "jtlabwc did not advertise wlr-output-management. "
+                  "Display detection needs a compositor that supports it.",
+            9.5, 400, C_DIM, 0.85,
+            CONTENT_X + 24.0, 186.0, CONTENT_W - 48.0, 2);
+    } else {
+        cairo_save(cr);
+        cairo_rectangle(cr, CONTENT_X, view_top, CONTENT_W,
+                            view_bottom - view_top);
+        cairo_clip(cr);
 
-    display_card(cr, 122.0, "HDMI-A-1", "Dell U2720Q · 27\"",
-                 1, SEG_REFRESH_A, SEG_SCALE_A, SEG_ORIENT_A, TOG_PRIMARY_A);
-    display_card(cr, 122.0 + card_h + gap, "DP-1", "Unknown display",
-                 0, SEG_REFRESH_B, SEG_SCALE_B, SEG_ORIENT_B, TOG_PRIMARY_B);
+        int ord = 0;
+        for (int i = 0; i < MAX_HEADS; i++) {
+            if (!g_heads[i].used)
+                continue;
+            double y = 122.0 + ord * 220.0 - g_ui.disp_scroll;
+            ord++;
+            if (y + 206.0 < view_top || y > view_bottom)
+                continue;
+            display_card(cr, i, y);
+        }
+
+        cairo_restore(cr);
+    }
+
+    paint_button(cr, CONTENT_X, btn_y, 140.0, 36.0,
+                 "Arrange", 0, BTN_POSITION);
+    paint_button(cr, CONTENT_X + 152.0, btn_y, 130.0, 36.0,
+                 "Apply", 1, BTN_DISPLAYS_APPLY);
+    paint_button(cr, CONTENT_X + 294.0, btn_y, 110.0, 36.0,
+                 "Reset", 0, BTN_DISPLAYS_RESET);
 
     text_wrap(cr,
-        "Output changes are shown locally. Writing them for real would mean "
-        "updating the compositor's output configuration and asking jtlabwc "
-        "to apply it.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, footnote_y, CONTENT_W, 2);
+        "Changes are sent to jtlabwc through wlr-output-management and "
+        "applied atomically. At least one display must remain enabled. "
+        "Scroll to reach additional outputs.",
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, btn_y + 44.0, CONTENT_W, 2);
 }
 
-/* ------------------------------------------------------------------ */
+
 /*  Page: Session                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -2664,6 +3513,8 @@ static void paint_content(cairo_t *cr)
     }
 
     paint_footer(cr);
+    paint_position_editor(cr);
+    paint_mode_picker(cr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2737,6 +3588,10 @@ struct App {
 
     Output outputs[MAX_OUTPUTS];
     int output_count;
+
+    struct zwlr_output_manager_v1 *output_manager;
+    uint32_t output_serial;
+    struct zwlr_output_configuration_v1 *pending_config;
 
     int quit;
     double t0;
@@ -3220,6 +4075,398 @@ static const struct wl_surface_listener surface_listener = {
     .leave = surface_leave,
 };
 
+/* ---- output management ------------------------------------------- */
+
+static void head_pick_default_mode(Head *h)
+{
+    if (head_mode_valid(h))
+        return;
+    int pick = -1;
+    for (int i = 0; i < h->mode_count; i++) {
+        const HeadMode *m = &h->modes[i];
+        if (!m->available || m->width <= 0)
+            continue;
+        if (m->preferred) {
+            pick = i;
+            break;
+        }
+        if (pick < 0)
+            pick = i;
+    }
+    if (pick >= 0)
+        h->p_mode = pick;
+}
+
+static HeadMode *head_mode_from_obj(Head *h, struct zwlr_output_mode_v1 *obj)
+{
+    for (int i = 0; i < h->mode_count; i++)
+        if (h->modes[i].obj == obj)
+            return &h->modes[i];
+    return NULL;
+}
+
+static void mode_size(void *data, struct zwlr_output_mode_v1 *mode,
+                      int32_t width, int32_t height)
+{
+    (void)mode;
+    HeadMode *m = data;
+    m->width = width;
+    m->height = height;
+}
+
+static void mode_refresh(void *data, struct zwlr_output_mode_v1 *mode,
+                         int32_t refresh)
+{
+    (void)mode;
+    HeadMode *m = data;
+    m->refresh = refresh;
+}
+
+static void mode_preferred(void *data, struct zwlr_output_mode_v1 *mode)
+{
+    (void)mode;
+    HeadMode *m = data;
+    m->preferred = 1;
+}
+
+static void mode_finished(void *data, struct zwlr_output_mode_v1 *mode)
+{
+    HeadMode *m = data;
+    m->available = 0;
+    m->obj = NULL;
+    zwlr_output_mode_v1_destroy(mode);
+}
+
+static const struct zwlr_output_mode_v1_listener mode_listener = {
+    .size = mode_size,
+    .refresh = mode_refresh,
+    .preferred = mode_preferred,
+    .finished = mode_finished,
+};
+
+static void head_name(void *data, struct zwlr_output_head_v1 *head,
+                      const char *name)
+{
+    (void)head;
+    Head *h = data;
+    snprintf(h->name, sizeof h->name, "%s", name ? name : "");
+}
+
+static void head_description_event(void *data,
+                                   struct zwlr_output_head_v1 *head,
+                                   const char *description)
+{
+    (void)head;
+    Head *h = data;
+    snprintf(h->description, sizeof h->description, "%s",
+             description ? description : "");
+}
+
+static void head_physical_size(void *data, struct zwlr_output_head_v1 *head,
+                               int32_t width, int32_t height)
+{
+    (void)head;
+    Head *h = data;
+    h->phys_w = width;
+    h->phys_h = height;
+}
+
+static void head_mode_event(void *data, struct zwlr_output_head_v1 *head,
+                            struct zwlr_output_mode_v1 *mode)
+{
+    (void)head;
+    Head *h = data;
+    if (h->mode_count >= MAX_MODES) {
+        zwlr_output_mode_v1_destroy(mode);
+        return;
+    }
+    HeadMode *m = &h->modes[h->mode_count++];
+    memset(m, 0, sizeof *m);
+    m->obj = mode;
+    m->available = 1;
+    zwlr_output_mode_v1_add_listener(mode, &mode_listener, m);
+}
+
+static void head_enabled(void *data, struct zwlr_output_head_v1 *head,
+                         int32_t enabled)
+{
+    (void)head;
+    Head *h = data;
+    h->enabled = enabled != 0;
+}
+
+static void head_current_mode(void *data, struct zwlr_output_head_v1 *head,
+                              struct zwlr_output_mode_v1 *mode)
+{
+    (void)head;
+    Head *h = data;
+    h->current_mode = mode;
+    HeadMode *m = head_mode_from_obj(h, mode);
+    if (m) {
+        h->cur_w = m->width;
+        h->cur_h = m->height;
+        h->cur_refresh = m->refresh;
+    }
+}
+
+static void head_position(void *data, struct zwlr_output_head_v1 *head,
+                          int32_t x, int32_t y)
+{
+    (void)head;
+    Head *h = data;
+    h->x = x;
+    h->y = y;
+}
+
+static void head_transform(void *data, struct zwlr_output_head_v1 *head,
+                           int32_t transform)
+{
+    (void)head;
+    Head *h = data;
+    h->transform = transform;
+}
+
+static void head_scale(void *data, struct zwlr_output_head_v1 *head,
+                       wl_fixed_t scale)
+{
+    (void)head;
+    Head *h = data;
+    double s = wl_fixed_to_double(scale);
+    h->scale = s > 0.0 ? s : 1.0;
+}
+
+static void head_finished(void *data, struct zwlr_output_head_v1 *head)
+{
+    Head *h = data;
+    h->used = 0;
+    h->head = NULL;
+    h->current_mode = NULL;
+    for (int i = 0; i < h->mode_count; i++) {
+        h->modes[i].available = 0;
+        h->modes[i].obj = NULL;
+    }
+    zwlr_output_head_v1_destroy(head);
+}
+
+static void head_make(void *data, struct zwlr_output_head_v1 *head,
+                      const char *make)
+{
+    (void)head;
+    Head *h = data;
+    snprintf(h->make, sizeof h->make, "%s", make ? make : "");
+}
+
+static void head_model(void *data, struct zwlr_output_head_v1 *head,
+                       const char *model)
+{
+    (void)head;
+    Head *h = data;
+    snprintf(h->model, sizeof h->model, "%s", model ? model : "");
+}
+
+static void head_serial_number(void *data, struct zwlr_output_head_v1 *head,
+                               const char *serial)
+{
+    (void)data;
+    (void)head;
+    (void)serial;
+}
+
+static void head_adaptive_sync(void *data, struct zwlr_output_head_v1 *head,
+                               uint32_t state)
+{
+    (void)data;
+    (void)head;
+    (void)state;
+}
+
+static const struct zwlr_output_head_v1_listener head_listener = {
+    .name = head_name,
+    .description = head_description_event,
+    .physical_size = head_physical_size,
+    .mode = head_mode_event,
+    .enabled = head_enabled,
+    .current_mode = head_current_mode,
+    .position = head_position,
+    .transform = head_transform,
+    .scale = head_scale,
+    .finished = head_finished,
+    .make = head_make,
+    .model = head_model,
+    .serial_number = head_serial_number,
+    .adaptive_sync = head_adaptive_sync,
+};
+
+static void manager_head(void *data, struct zwlr_output_manager_v1 *manager,
+                         struct zwlr_output_head_v1 *head)
+{
+    (void)manager;
+    App *a = data;
+
+    int slot = -1;
+    for (int i = 0; i < MAX_HEADS; i++) {
+        if (!g_heads[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        zwlr_output_head_v1_destroy(head);
+        return;
+    }
+
+    Head *h = &g_heads[slot];
+    memset(h, 0, sizeof *h);
+    h->used = 1;
+    h->head = head;
+    h->scale = 1.0;
+    h->p_scale = 1.0;
+    h->p_mode = -1;
+    h->pending_ready = 0;
+    snprintf(h->name, sizeof h->name, "Output %d", slot + 1);
+    zwlr_output_head_v1_add_listener(head, &head_listener, h);
+    a->dirty = 1;
+}
+
+static void manager_done(void *data, struct zwlr_output_manager_v1 *manager,
+                         uint32_t serial)
+{
+    (void)manager;
+    App *a = data;
+    a->output_serial = serial;
+
+    for (int i = 0; i < MAX_HEADS; i++) {
+        Head *h = &g_heads[i];
+        if (!h->used)
+            continue;
+        if (!h->pending_ready || !h->dirty)
+            displays_sync_pending(h);
+    }
+    a->dirty = 1;
+}
+
+static void manager_finished(void *data,
+                             struct zwlr_output_manager_v1 *manager)
+{
+    App *a = data;
+    if (a->output_manager == manager)
+        a->output_manager = NULL;
+    g_output_manager_available = 0;
+    for (int i = 0; i < MAX_HEADS; i++) {
+        g_heads[i].used = 0;
+        g_heads[i].head = NULL;
+        g_heads[i].current_mode = NULL;
+        for (int j = 0; j < g_heads[i].mode_count; j++)
+            g_heads[i].modes[j].obj = NULL;
+    }
+    zwlr_output_manager_v1_destroy(manager);
+    a->dirty = 1;
+}
+
+static const struct zwlr_output_manager_v1_listener manager_listener = {
+    .head = manager_head,
+    .done = manager_done,
+    .finished = manager_finished,
+};
+
+static void config_succeeded(void *data,
+                             struct zwlr_output_configuration_v1 *config)
+{
+    App *a = data;
+    if (a->pending_config == config)
+        a->pending_config = NULL;
+    zwlr_output_configuration_v1_destroy(config);
+    for (int i = 0; i < MAX_HEADS; i++)
+        if (g_heads[i].used)
+            g_heads[i].dirty = 0;
+    displays_commit();
+    ui_toast("Display configuration applied");
+    a->dirty = 1;
+}
+
+static void config_failed(void *data,
+                          struct zwlr_output_configuration_v1 *config)
+{
+    App *a = data;
+    if (a->pending_config == config)
+        a->pending_config = NULL;
+    zwlr_output_configuration_v1_destroy(config);
+    ui_toast("Display configuration rejected");
+    a->dirty = 1;
+}
+
+static void config_cancelled(void *data,
+                             struct zwlr_output_configuration_v1 *config)
+{
+    App *a = data;
+    if (a->pending_config == config)
+        a->pending_config = NULL;
+    zwlr_output_configuration_v1_destroy(config);
+    ui_toast("Display configuration cancelled");
+    a->dirty = 1;
+}
+
+static const struct zwlr_output_configuration_v1_listener config_listener = {
+    .succeeded = config_succeeded,
+    .failed = config_failed,
+    .cancelled = config_cancelled,
+};
+
+static void displays_apply(void)
+{
+    App *a = g_app;
+    if (!a || !a->output_manager) {
+        ui_toast("Output management is not available");
+        return;
+    }
+    if (a->pending_config) {
+        ui_toast("Waiting for the compositor");
+        return;
+    }
+    if (head_enabled_count() <= 0) {
+        ui_toast("At least one display must stay enabled");
+        return;
+    }
+
+    struct zwlr_output_configuration_v1 *config =
+        zwlr_output_manager_v1_create_configuration(a->output_manager,
+                                                    a->output_serial);
+    if (!config) {
+        ui_toast("Could not create a display configuration");
+        return;
+    }
+
+    for (int i = 0; i < MAX_HEADS; i++) {
+        Head *h = &g_heads[i];
+        if (!h->used || !h->head)
+            continue;
+        if (!h->p_enabled) {
+            zwlr_output_configuration_v1_disable_head(config, h->head);
+            continue;
+        }
+
+        head_pick_default_mode(h);
+        struct zwlr_output_configuration_head_v1 *ch =
+            zwlr_output_configuration_v1_enable_head(config, h->head);
+        if (!ch)
+            continue;
+
+        if (head_mode_valid(h))
+            zwlr_output_configuration_head_v1_set_mode(
+                ch, h->modes[h->p_mode].obj);
+        zwlr_output_configuration_head_v1_set_scale(
+            ch, wl_fixed_from_double(h->p_scale));
+        zwlr_output_configuration_head_v1_set_transform(ch, h->p_transform);
+        zwlr_output_configuration_head_v1_set_position(ch, h->p_x, h->p_y);
+    }
+
+    a->pending_config = config;
+    zwlr_output_configuration_v1_add_listener(config, &config_listener, a);
+    zwlr_output_configuration_v1_apply(config);
+    ui_toast("Applying display configuration…");
+}
+
+
 /* ---- interaction ------------------------------------------------- */
 
 static void slider_set_from_x(int idx, double x)
@@ -3279,6 +4526,64 @@ static void ui_activate(App *a, int idx)
         if (g_ui.page >= 0 && g_ui.page < PAGE_COUNT)
             g_ui.selected[g_ui.page] = h->a;
         break;
+    case HIT_DISP_RES:
+        g_ui.mode_picker_open = 1;
+        g_ui.mode_picker_head = h->a;
+        g_ui.pos_editor_open = 0;
+        g_ui.disp_drag = -1;
+        break;
+    case HIT_DISP_REFRESH: {
+        Head *hh = head_get(h->a);
+        if (!hh)
+            break;
+        int32_t pw = hh->cur_w, ph = hh->cur_h;
+        if (head_mode_valid(hh)) {
+            pw = hh->modes[hh->p_mode].width;
+            ph = hh->modes[hh->p_mode].height;
+        }
+        int32_t refreshes[8];
+        int rn = head_refreshes(hh, pw, ph, refreshes, 8);
+        if (h->b >= 0 && h->b < rn)
+            head_choose_refresh(hh, pw, ph, refreshes[h->b]);
+        break;
+    }
+    case HIT_DISP_SCALE: {
+        Head *hh = head_get(h->a);
+        if (hh && h->b >= 0 && h->b < DISP_SCALE_COUNT) {
+            hh->p_scale = DISP_SCALES[h->b];
+            hh->dirty = 1;
+        }
+        break;
+    }
+    case HIT_DISP_ORIENT: {
+        Head *hh = head_get(h->a);
+        if (hh) {
+            if (h->b == 0)
+                hh->p_transform = 0;
+            else
+                hh->p_transform = hh->p_transform == 3 ? 3 : 1;
+            hh->dirty = 1;
+        }
+        break;
+    }
+    case HIT_DISP_ENABLE:
+        displays_toggle_enabled(h->a);
+        break;
+    case HIT_DISP_PRIMARY:
+        displays_make_primary(h->a);
+        break;
+    case HIT_DISP_MODE: {
+        Head *hh = head_get(h->a);
+        if (hh) {
+            Resolution res[MAX_RESOLUTIONS];
+            int rn = head_resolutions(hh, res, MAX_RESOLUTIONS);
+            if (h->b >= 0 && h->b < rn)
+                head_choose_resolution(hh, res[h->b].w, res[h->b].h);
+        }
+        g_ui.mode_picker_open = 0;
+        break;
+    }
+
     case HIT_TERM_FIELD:
         if (!g_ui.terminal_editing) {
             g_ui.terminal_editing = 1;
@@ -3311,6 +4616,33 @@ static void ui_activate(App *a, int idx)
             break;
         case BTN_UPDATE:
             ui_toast("Preview only — update check is not wired up");
+            break;
+        case BTN_POSITION:
+            g_ui.pos_editor_open = 1;
+            g_ui.mode_picker_open = 0;
+            g_ui.pos_layout_valid = 0;
+            g_ui.disp_drag = -1;
+            g_ui.hover = -1;
+            g_ui.pressed = -1;
+            ui_toast("Drag displays to arrange them");
+            break;
+        case BTN_POS_DONE:
+            g_ui.pos_editor_open = 0;
+            g_ui.disp_drag = -1;
+            ui_toast("Arrangement updated — press Apply to use it");
+            break;
+        case BTN_DISPLAYS_APPLY:
+            displays_apply();
+            break;
+        case BTN_DISPLAYS_RESET:
+            displays_sync_all();
+            g_ui.mode_picker_open = 0;
+            g_ui.pos_editor_open = 0;
+            g_ui.disp_drag = -1;
+            ui_toast("Display changes reset");
+            break;
+        case BTN_MODE_CLOSE:
+            g_ui.mode_picker_open = 0;
             break;
         default:
             ui_toast("Preview only — no command was run");
@@ -3380,6 +4712,32 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
     g_ui.pointer_x = wl_fixed_to_double(sx);
     g_ui.pointer_y = wl_fixed_to_double(sy);
 
+    if (g_ui.mode_picker_open) {
+        g_ui.hover = hit_at(g_ui.pointer_x, g_ui.pointer_y);
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.pos_editor_open) {
+        if (g_ui.disp_drag >= 0 && g_ui.pos_scale > 0.0) {
+            Head *h = head_get(g_ui.disp_drag);
+            if (h) {
+                double nx = (g_ui.pointer_x - g_ui.disp_drag_ox -
+                             g_ui.pos_offx) / g_ui.pos_scale;
+                double ny = (g_ui.pointer_y - g_ui.disp_drag_oy -
+                             g_ui.pos_offy) / g_ui.pos_scale;
+                h->p_x = (int32_t)llround(nx);
+                h->p_y = (int32_t)llround(ny);
+                h->dirty = 1;
+            }
+        }
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
     if (g_ui.kb_drag) {
         double delta = g_ui.kb_drag_y - g_ui.pointer_y;
         if (fabs(delta) > 3.0)
@@ -3416,9 +4774,80 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
 
     double x = g_ui.pointer_x;
     double y = g_ui.pointer_y;
+
+    if (g_ui.mode_picker_open) {
+        if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            int idx = hit_at(x, y);
+            int handled = 0;
+            if (idx >= 0) {
+                Hit *hh = &g_hits[idx];
+                if (hh->kind == HIT_DISP_MODE ||
+                    (hh->kind == HIT_BUTTON && hh->a == BTN_MODE_CLOSE)) {
+                    ui_activate(a, idx);
+                    handled = 1;
+                }
+            }
+            if (!handled) {
+                Head *h = head_get(g_ui.mode_picker_head);
+                double px = 0.0, py = 0.0, pw = 0.0, ph = 0.0;
+                if (h)
+                    mode_picker_rect(h, &px, &py, &pw, &ph);
+                if (!h || x < px || x > px + pw ||
+                    y < py || y > py + ph)
+                    g_ui.mode_picker_open = 0;
+            }
+        }
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
     int idx = hit_at(x, y);
 
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (g_ui.pos_editor_open) {
+            double pw = 700.0, ph = 420.0;
+            double px = (WIN_W - pw) / 2.0;
+            double py = (WIN_H - ph) / 2.0;
+            double dbx = px + pw - 24.0 - 120.0;
+            double dby = py + ph - 24.0 - 36.0;
+            if (x >= dbx && x <= dbx + 120.0 &&
+                y >= dby && y <= dby + 36.0) {
+                g_ui.pos_editor_open = 0;
+                g_ui.disp_drag = -1;
+                ui_toast("Arrangement updated — press Apply to use it");
+                a->dirty = 1;
+                update_cursor(a);
+                return;
+            }
+            /* Pick the topmost display rectangle. */
+            for (int i = MAX_HEADS - 1; i >= 0; i--) {
+                if (!head_in_arrangement(i))
+                    continue;
+                Head *h = &g_heads[i];
+                if (!h->p_enabled)
+                    continue;
+                double lw, lh;
+                head_logical_size(h, &lw, &lh);
+                double rx = g_ui.pos_offx + h->p_x * g_ui.pos_scale;
+                double ry = g_ui.pos_offy + h->p_y * g_ui.pos_scale;
+                double rw = lw * g_ui.pos_scale;
+                double rh = lh * g_ui.pos_scale;
+                if (rw < 28.0) rw = 28.0;
+                if (rh < 20.0) rh = 20.0;
+                if (x >= rx && x <= rx + rw && y >= ry && y <= ry + rh) {
+                    g_ui.disp_drag = i;
+                    g_ui.disp_drag_ox = x - rx;
+                    g_ui.disp_drag_oy = y - ry;
+                    a->dirty = 1;
+                    update_cursor(a);
+                    return;
+                }
+            }
+            a->dirty = 1;
+            update_cursor(a);
+            return;
+        }
         if (g_ui.page == PAGE_KEYBINDINGS) {
             double ty, th, view_h;
             kb_geom(&ty, &th, &view_h);
@@ -3436,14 +4865,18 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
         if (idx >= 0 && g_hits[idx].kind == HIT_SLIDER)
             slider_set_from_x(idx, x);
     } else {
+        if (g_ui.pos_editor_open) {
+            g_ui.disp_drag = -1;
+            a->dirty = 1;
+            update_cursor(a);
+            return;
+        }
         int kind = (idx >= 0) ? g_hits[idx].kind : HIT_NONE;
         int pressed = g_ui.pressed;
         int was_drag = g_ui.kb_drag && g_ui.kb_drag_moved;
         g_ui.kb_drag = 0;
         if (idx >= 0 && idx == pressed && kind != HIT_SLIDER && !was_drag)
             ui_activate(a, idx);
-        /* Persist sliders once the drag ends rather than on every motion
-         * event. */
         if (pressed >= 0 && pressed < g_hit_count &&
             g_hits[pressed].kind == HIT_SLIDER) {
             if (g_hits[pressed].a == SL_START_DELAY) {
@@ -3468,8 +4901,26 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
     (void)pointer; (void)time;
     App *a = data;
 
-    if (g_ui.page != PAGE_KEYBINDINGS ||
-        axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+        return;
+
+    if (g_ui.page == PAGE_DISPLAYS && !g_ui.pos_editor_open &&
+        !g_ui.mode_picker_open) {
+        int max_scroll = head_count() * 220 -
+                         (int)(WIN_H - 160.0 - 118.0);
+        if (max_scroll < 0)
+            max_scroll = 0;
+        g_ui.disp_scroll += (int)lround(wl_fixed_to_double(value));
+        if (g_ui.disp_scroll < 0)
+            g_ui.disp_scroll = 0;
+        if (g_ui.disp_scroll > max_scroll)
+            g_ui.disp_scroll = max_scroll;
+        g_ui.hover = -1;
+        a->dirty = 1;
+        return;
+    }
+
+    if (g_ui.page != PAGE_KEYBINDINGS)
         return;
 
     double ty, th, view_h;
@@ -3623,6 +5074,16 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
     a->dirty = 1;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
 
+    if (g_ui.mode_picker_open && sym == XKB_KEY_Escape) {
+        g_ui.mode_picker_open = 0;
+        return;
+    }
+    if (g_ui.pos_editor_open && sym == XKB_KEY_Escape) {
+        g_ui.pos_editor_open = 0;
+        g_ui.disp_drag = -1;
+        return;
+    }
+
     /* The Add application field owns the keyboard while it is open. */
     if (g_ui.page == PAGE_STARTUP && g_ui.startup_adding) {
         int r = text_input_key(a, key, sym, g_ui.startup_input,
@@ -3768,6 +5229,16 @@ static void registry_global(void *data, struct wl_registry *registry,
         a->seat = wl_registry_bind(registry, name, &wl_seat_interface,
                                    version < 5 ? version : 5);
         wl_seat_add_listener(a->seat, &seat_listener, a);
+    } else if (!strcmp(interface,
+                       zwlr_output_manager_v1_interface.name)) {
+        uint32_t v = version < 4 ? version : 4;
+        a->output_manager = wl_registry_bind(
+            registry, name, &zwlr_output_manager_v1_interface, v);
+        if (a->output_manager) {
+            g_output_manager_available = 1;
+            zwlr_output_manager_v1_add_listener(
+                a->output_manager, &manager_listener, a);
+        }
     } else if (!strcmp(interface, wl_output_interface.name)) {
         if (a->output_count < MAX_OUTPUTS) {
             Output *o = &a->outputs[a->output_count];
@@ -3930,6 +5401,49 @@ static void ctl_handle_line(App *a, char *line)
 
     if (!strcmp(line, "quit")) {
         a->quit = 1;
+        return;
+    }
+
+    if (!strcmp(line, "apply")) {
+        displays_apply();
+        a->dirty = 1;
+        return;
+    }
+
+    if (!strcmp(line, "reset")) {
+        displays_sync_all();
+        g_ui.mode_picker_open = 0;
+        g_ui.pos_editor_open = 0;
+        g_ui.disp_drag = -1;
+        ui_toast("Display changes reset");
+        a->dirty = 1;
+        return;
+    }
+
+    if (!strcmp(line, "dump")) {
+        fprintf(stderr,
+                "ui: page=%d pos_editor=%d mode_picker=%d drag=%d "
+                "scale=%.6f offx=%.3f offy=%.3f ox=%.3f oy=%.3f scroll=%d\n",
+                g_ui.page, g_ui.pos_editor_open, g_ui.mode_picker_open,
+                g_ui.disp_drag, g_ui.pos_scale, g_ui.pos_offx,
+                g_ui.pos_offy, g_ui.disp_drag_ox, g_ui.disp_drag_oy,
+                g_ui.disp_scroll);
+
+        for (int i = 0; i < MAX_HEADS; i++) {
+            Head *h = &g_heads[i];
+            if (!h->used)
+                continue;
+            fprintf(stderr,
+                    "head %d: %s | %s | enabled=%d pos=%d,%d scale=%.2f "
+                    "transform=%d mode=%d/%d cur=%dx%d@%d mHz modes=%d "
+                    "pending=%d mode=%d scale=%.2f transform=%d pos=%d,%d "
+                    "dirty=%d\n",
+                    i, h->name, h->description, h->enabled, h->x, h->y,
+                    h->scale, h->transform, h->p_mode, h->mode_count,
+                    h->cur_w, h->cur_h, h->cur_refresh, h->mode_count,
+                    h->p_enabled, h->p_mode, h->p_scale, h->p_transform,
+                    h->p_x, h->p_y, h->dirty);
+        }
         return;
     }
 
@@ -4168,6 +5682,24 @@ static void app_cleanup(App *a)
 {
     ctl_cleanup(a);
 
+    if (a->pending_config) {
+        zwlr_output_configuration_v1_destroy(a->pending_config);
+        a->pending_config = NULL;
+    }
+    if (a->output_manager) {
+        for (int i = 0; i < MAX_HEADS; i++) {
+            Head *h = &g_heads[i];
+            for (int j = 0; j < h->mode_count; j++)
+                if (h->modes[j].obj)
+                    zwlr_output_mode_v1_destroy(h->modes[j].obj);
+            if (h->head)
+                zwlr_output_head_v1_destroy(h->head);
+            memset(h, 0, sizeof *h);
+        }
+        zwlr_output_manager_v1_destroy(a->output_manager);
+        a->output_manager = NULL;
+    }
+
     if (a->frame_cb) {
         wl_callback_destroy(a->frame_cb);
         a->frame_cb = NULL;
@@ -4328,6 +5860,9 @@ int main(int argc, char **argv)
 
     App a;
     memset(&a, 0, sizeof a);
+    g_app = &a;
+    g_output_manager_available = 0;
+    memset(g_heads, 0, sizeof g_heads);
     a.scale = 1;
     a.ctl_fd = -1;
     a.ctl_client_fd = -1;
