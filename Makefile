@@ -15,6 +15,7 @@ XDG_ICON_XML := $(WAYLAND_PROTOCOLS)/staging/xdg-toplevel-icon/xdg-toplevel-icon
 CURSOR_SHAPE_XML := $(WAYLAND_PROTOCOLS)/staging/cursor-shape/cursor-shape-v1.xml
 TABLET_XML := $(WAYLAND_PROTOCOLS)/unstable/tablet/tablet-unstable-v2.xml
 OUTPUT_MGMT_XML := wlr-output-management-unstable-v1.xml
+FOREIGN_TOPLEVEL_XML := wlr-foreign-toplevel-management-unstable-v1.xml
 
 GEN = xdg-shell-client-protocol.h xdg-shell-protocol.c \
       xdg-decoration-client-protocol.h xdg-decoration-protocol.c \
@@ -22,7 +23,9 @@ GEN = xdg-shell-client-protocol.h xdg-shell-protocol.c \
       cursor-shape-client-protocol.h cursor-shape-protocol.c \
       tablet-client-protocol.h tablet-protocol.c \
       wlr-output-management-unstable-v1-client-protocol.h \
-      wlr-output-management-unstable-v1-protocol.c
+      wlr-output-management-unstable-v1-protocol.c \
+      wlr-foreign-toplevel-management-unstable-v1-client-protocol.h \
+      wlr-foreign-toplevel-management-unstable-v1-protocol.c
 
 all: jtsettings jtsettingsctl jtstartup
 
@@ -31,6 +34,7 @@ jtsettings: jtsettings.c $(GEN)
 		xdg-shell-protocol.c xdg-decoration-protocol.c \
 		xdg-toplevel-icon-protocol.c cursor-shape-protocol.c \
 		tablet-protocol.c wlr-output-management-unstable-v1-protocol.c \
+		wlr-foreign-toplevel-management-unstable-v1-protocol.c \
 		$(LDFLAGS) $(LDLIBS)
 
 jtsettingsctl: jtsettingsctl.c
@@ -73,6 +77,12 @@ wlr-output-management-unstable-v1-client-protocol.h: $(OUTPUT_MGMT_XML)
 	wayland-scanner client-header $< $@
 
 wlr-output-management-unstable-v1-protocol.c: $(OUTPUT_MGMT_XML)
+	wayland-scanner private-code $< $@
+
+wlr-foreign-toplevel-management-unstable-v1-client-protocol.h: $(FOREIGN_TOPLEVEL_XML)
+	wayland-scanner client-header $< $@
+
+wlr-foreign-toplevel-management-unstable-v1-protocol.c: $(FOREIGN_TOPLEVEL_XML)
 	wayland-scanner private-code $< $@
 
 install: jtsettings jtsettingsctl jtstartup

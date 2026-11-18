@@ -37,6 +37,7 @@
 #include "xdg-toplevel-icon-client-protocol.h"
 #include "cursor-shape-client-protocol.h"
 #include "wlr-output-management-unstable-v1-client-protocol.h"
+#include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -3391,7 +3392,8 @@ static void page_defaultapps(cairo_t *cr)
     text_draw(cr, "Choose the applications jtlab and your desktop open by default",
               9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
 
-    double y = 130.0;
+    /* Match the Keybindings page: leave breathing room under the header. */
+    double y = 152.0;
     double row_h = 58.0;
     double gap = 6.0;
     double field_w = 292.0;
@@ -3457,7 +3459,8 @@ static void page_defaultapps(cairo_t *cr)
         "Defaults are applied through XDG and stored in "
         "~/.config/jt/defaultapps.conf. The terminal is also written to "
         "keybinds.conf for Super + Return.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, y + APP_CAT_COUNT * (row_h + gap) + 6.0,
+        8.8, 400, C_FAINT, 0.8, CONTENT_X,
+        y + (APP_CAT_COUNT - 1) * (row_h + gap) + row_h + 8.0,
         CONTENT_W, 2);
 }
 
@@ -4066,7 +4069,7 @@ static void page_about(cairo_t *cr)
     static const char *const vals[] = {
         "jtlabwc · Wayland", "cairo + Pango · no GTK",
         "#030303 · amber #E8A03C", "Liberation Sans · 10 pt",
-        "$XDG_RUNTIME_DIR/jtsettings-ctl.sock", "~/.config/labwc",
+        "$XDG_RUNTIME_DIR/jtsettings-ctl.sock", "~/jt",
     };
 
     for (int i = 0; i < 6; i++) {
@@ -4165,6 +4168,18 @@ typedef struct {
     App *app;
 } Output;
 
+/* Companion windows we can raise through zwlr_foreign_toplevel_manager_v1,
+ * ported from JTLab's focus_app_window() helper. */
+#define MAX_FOREIGN_TOPLEVELS 128
+
+typedef struct {
+    struct zwlr_foreign_toplevel_handle_v1 *handle;
+    char *app_id;
+} ForeignToplevel;
+
+static ForeignToplevel g_toplevels[MAX_FOREIGN_TOPLEVELS];
+static int g_toplevel_count;
+
 struct App {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -4212,6 +4227,7 @@ struct App {
     int output_count;
 
     struct zwlr_output_manager_v1 *output_manager;
+    struct zwlr_foreign_toplevel_manager_v1 *toplevel_manager;
     uint32_t output_serial;
     struct zwlr_output_configuration_v1 *pending_config;
 
@@ -4228,6 +4244,32 @@ static void defaultapps_mark_dirty(void)
 {
     if (g_app)
         g_app->dirty = 1;
+}
+
+/* Raise the first open window whose app_id matches, as JTLab does. */
+static int
+focus_app_window(App *a, const char *app_id)
+{
+    if (!a || !a->seat || !app_id)
+        return 0;
+    for (int i = 0; i < g_toplevel_count; i++) {
+        const char *id = g_toplevels[i].app_id;
+        if (id && g_toplevels[i].handle && !strcasecmp(id, app_id)) {
+            zwlr_foreign_toplevel_handle_v1_activate(
+                g_toplevels[i].handle, a->seat);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void
+launch_jtupdate(void)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof cmd,
+             "jtupdate '#%06X' >/dev/null 2>&1 &", accent_rgb & 0xFFFFFF);
+    if (system(cmd) != 0) { }
 }
 
 /* ------------------------------------------------------------------ */
@@ -5252,7 +5294,12 @@ static void ui_activate(App *a, int idx)
             ui_toast("Preview only — docs would open in a browser");
             break;
         case BTN_UPDATE:
-            ui_toast("Preview only — update check is not wired up");
+            if (focus_app_window(a, "jtupdate"))
+                ui_toast("Focused jtupdate");
+            else {
+                launch_jtupdate();
+                ui_toast("Opening jtupdate…");
+            }
             break;
         case BTN_POSITION:
             g_ui.pos_editor_open = 1;
@@ -5869,6 +5916,150 @@ static const struct wl_seat_listener seat_listener = {
     .name = seat_name,
 };
 
+/* ---- Foreign toplevels: raise a companion app if it is already open ---- */
+
+static int
+foreign_toplevel_index(struct zwlr_foreign_toplevel_handle_v1 *handle)
+{
+    for (int i = 0; i < g_toplevel_count; i++)
+        if (g_toplevels[i].handle == handle)
+            return i;
+    return -1;
+}
+
+static void
+foreign_toplevel_set_app_id(void *data,
+                            struct zwlr_foreign_toplevel_handle_v1 *handle,
+                            const char *app_id)
+{
+    (void)data;
+    int idx = foreign_toplevel_index(handle);
+    if (idx < 0)
+        return;
+    free(g_toplevels[idx].app_id);
+    g_toplevels[idx].app_id = app_id ? strdup(app_id) : NULL;
+}
+
+static void
+foreign_toplevel_set_title(void *data,
+                           struct zwlr_foreign_toplevel_handle_v1 *handle,
+                           const char *title)
+{
+    (void)data; (void)handle; (void)title;
+}
+
+static void
+foreign_toplevel_set_state(void *data,
+                           struct zwlr_foreign_toplevel_handle_v1 *handle,
+                           struct wl_array *state)
+{
+    (void)data; (void)handle; (void)state;
+}
+
+static void
+foreign_toplevel_done(void *data,
+                      struct zwlr_foreign_toplevel_handle_v1 *handle)
+{
+    (void)data; (void)handle;
+}
+
+static void
+foreign_toplevel_closed(void *data,
+                        struct zwlr_foreign_toplevel_handle_v1 *handle)
+{
+    (void)data;
+    int idx = foreign_toplevel_index(handle);
+    if (idx < 0)
+        return;
+    free(g_toplevels[idx].app_id);
+    g_toplevels[idx] = g_toplevels[--g_toplevel_count];
+    memset(&g_toplevels[g_toplevel_count], 0,
+           sizeof g_toplevels[g_toplevel_count]);
+    zwlr_foreign_toplevel_handle_v1_destroy(handle);
+}
+
+static void
+foreign_toplevel_parent(void *data,
+                        struct zwlr_foreign_toplevel_handle_v1 *handle,
+                        struct zwlr_foreign_toplevel_handle_v1 *parent)
+{
+    (void)data; (void)handle; (void)parent;
+}
+
+static void
+foreign_toplevel_output_enter(void *data,
+                              struct zwlr_foreign_toplevel_handle_v1 *handle,
+                              struct wl_output *output)
+{
+    (void)data; (void)handle; (void)output;
+}
+
+static void
+foreign_toplevel_output_leave(void *data,
+                              struct zwlr_foreign_toplevel_handle_v1 *handle,
+                              struct wl_output *output)
+{
+    (void)data; (void)handle; (void)output;
+}
+
+static const struct zwlr_foreign_toplevel_handle_v1_listener
+foreign_toplevel_listener = {
+    .title = foreign_toplevel_set_title,
+    .app_id = foreign_toplevel_set_app_id,
+    .output_enter = foreign_toplevel_output_enter,
+    .output_leave = foreign_toplevel_output_leave,
+    .state = foreign_toplevel_set_state,
+    .done = foreign_toplevel_done,
+    .closed = foreign_toplevel_closed,
+    .parent = foreign_toplevel_parent,
+};
+
+static void
+foreign_toplevel_clear(void)
+{
+    for (int i = 0; i < g_toplevel_count; i++) {
+        if (g_toplevels[i].handle)
+            zwlr_foreign_toplevel_handle_v1_destroy(g_toplevels[i].handle);
+        free(g_toplevels[i].app_id);
+        memset(&g_toplevels[i], 0, sizeof g_toplevels[i]);
+    }
+    g_toplevel_count = 0;
+}
+
+static void
+foreign_toplevel_new(void *data,
+                     struct zwlr_foreign_toplevel_manager_v1 *manager,
+                     struct zwlr_foreign_toplevel_handle_v1 *handle)
+{
+    (void)data; (void)manager;
+    if (g_toplevel_count >= MAX_FOREIGN_TOPLEVELS) {
+        zwlr_foreign_toplevel_handle_v1_destroy(handle);
+        return;
+    }
+    ForeignToplevel *t = &g_toplevels[g_toplevel_count++];
+    memset(t, 0, sizeof *t);
+    t->handle = handle;
+    zwlr_foreign_toplevel_handle_v1_add_listener(
+        handle, &foreign_toplevel_listener, NULL);
+}
+
+static void
+foreign_toplevel_manager_finished(void *data,
+                                  struct zwlr_foreign_toplevel_manager_v1 *manager)
+{
+    App *a = data;
+    if (a && a->toplevel_manager == manager)
+        a->toplevel_manager = NULL;
+    zwlr_foreign_toplevel_manager_v1_destroy(manager);
+    foreign_toplevel_clear();
+}
+
+static const struct zwlr_foreign_toplevel_manager_v1_listener
+foreign_toplevel_manager_listener = {
+    .toplevel = foreign_toplevel_new,
+    .finished = foreign_toplevel_manager_finished,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version)
@@ -5911,6 +6102,15 @@ static void registry_global(void *data, struct wl_registry *registry,
             g_output_manager_available = 1;
             zwlr_output_manager_v1_add_listener(
                 a->output_manager, &manager_listener, a);
+        }
+    } else if (!strcmp(interface,
+                       zwlr_foreign_toplevel_manager_v1_interface.name)) {
+        uint32_t v = version < 3 ? version : 3;
+        a->toplevel_manager = wl_registry_bind(
+            registry, name, &zwlr_foreign_toplevel_manager_v1_interface, v);
+        if (a->toplevel_manager) {
+            zwlr_foreign_toplevel_manager_v1_add_listener(
+                a->toplevel_manager, &foreign_toplevel_manager_listener, a);
         }
     } else if (!strcmp(interface, wl_output_interface.name)) {
         if (a->output_count < MAX_OUTPUTS) {
@@ -6374,6 +6574,12 @@ static void app_cleanup(App *a)
         }
         zwlr_output_manager_v1_destroy(a->output_manager);
         a->output_manager = NULL;
+    }
+
+    foreign_toplevel_clear();
+    if (a->toplevel_manager) {
+        zwlr_foreign_toplevel_manager_v1_destroy(a->toplevel_manager);
+        a->toplevel_manager = NULL;
     }
 
     if (a->frame_cb) {
