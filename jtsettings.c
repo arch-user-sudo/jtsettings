@@ -73,6 +73,13 @@ static double WIN_H = DESIGN_H;
 #define CONTENT_X (SIDEBAR_W + 36.0)
 #define CONTENT_W (WIN_W - CONTENT_X - 36.0)
 
+/* Displays page: the action row is anchored close to the bottom of the
+ * content column, and the scrolling display-card viewport ends just above
+ * it.  Shared so drawing, hit-testing and scrolling always agree. */
+#define DISPLAY_BTN_Y       (WIN_H - 110.0)
+#define DISPLAY_VIEW_TOP    118.0
+#define DISPLAY_VIEW_BOTTOM (DISPLAY_BTN_Y - 10.0)
+
 #define FONT_FAMILY "Liberation"
 
 /* Startup Apps page.  The list is loaded from ~/.config/jt/startup.conf;
@@ -1032,7 +1039,7 @@ static int add_hit(int kind, int a, int b,
      * controls that are scrolled underneath the header or action row. */
     if (kind >= HIT_DISP_RES && kind <= HIT_DISP_MODE &&
         !g_ui.mode_picker_open &&
-        (y < 118.0 || y + h > WIN_H - 160.0))
+        (y < DISPLAY_VIEW_TOP || y + h > DISPLAY_VIEW_BOTTOM))
         return -1;
 
     if (g_hit_count >= MAX_HITS)
@@ -3835,9 +3842,9 @@ static void page_displays(cairo_t *cr)
 
     int n = head_count();
     int active = head_enabled_count();
-    double btn_y = WIN_H - 150.0;
-    double view_top = 118.0;
-    double view_bottom = btn_y - 10.0;
+    double btn_y = DISPLAY_BTN_Y;
+    double view_top = DISPLAY_VIEW_TOP;
+    double view_bottom = DISPLAY_VIEW_BOTTOM;
     int max_scroll = (int)(n * 220.0 - (view_bottom - view_top));
     if (max_scroll < 0)
         max_scroll = 0;
@@ -4025,7 +4032,9 @@ static void page_session(cairo_t *cr)
 
 static void page_about(cairo_t *cr)
 {
-    double cx = WIN_W / 2.0;
+    /* Center on the content column, not the whole window: the sidebar is
+     * outside this column and was pulling these elements left. */
+    double cx = CONTENT_X + CONTENT_W / 2.0;
 
     rgba(cr, C_ACCENT, 0.10);
     cairo_arc(cr, cx, 150.0, 54.0, 0.0, 2.0 * PI);
@@ -5622,7 +5631,7 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
     if (g_ui.page == PAGE_DISPLAYS && !g_ui.pos_editor_open &&
         !g_ui.mode_picker_open) {
         int max_scroll = head_count() * 220 -
-                         (int)(WIN_H - 160.0 - 118.0);
+                         (int)(DISPLAY_VIEW_BOTTOM - DISPLAY_VIEW_TOP);
         if (max_scroll < 0)
             max_scroll = 0;
         g_ui.disp_scroll += (int)lround(wl_fixed_to_double(value));
@@ -6743,6 +6752,12 @@ int main(int argc, char **argv)
     App a;
     memset(&a, 0, sizeof a);
     g_app = &a;
+    /*
+     * Some launchers (e.g. JTLab) ignore SIGCHLD to auto-reap their own
+     * children. Inherited across exec, this breaks system()/popen()/waitpid()
+     * with ECHILD, so reset to default for jtsettings' own subprocesses.
+     */
+    signal(SIGCHLD, SIG_DFL);
     g_output_manager_available = 0;
     memset(g_heads, 0, sizeof g_heads);
     a.scale = 1;
