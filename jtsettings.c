@@ -39,6 +39,7 @@
 #include "wlr-output-management-unstable-v1-client-protocol.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -77,6 +78,14 @@ static double WIN_H = DESIGN_H;
  * there are no built-in entries, so a fresh install starts empty. */
 #define STARTUP_MAX     8
 #define STARTUP_CMD_MAX 512
+
+/* Default Apps page: discovered .desktop files and saved selections. */
+#define MAX_DESKTOP_APPS 160
+#define APP_ID_MAX       128
+#define APP_NAME_MAX     160
+#define APP_EXEC_MAX     256
+#define APP_MIMES_MAX    1024
+#define DEFAULT_APPS_FILE "defaultapps.conf"
 
 #define C_BG        0x030303
 #define C_BG_TOP    0x070708
@@ -382,6 +391,7 @@ static double text_wrap(cairo_t *cr, const char *text, double size, int weight,
 enum {
     PAGE_KEYBINDINGS,
     PAGE_STARTUP,
+    PAGE_DEFAULT_APPS,
     PAGE_RULES,
     PAGE_INPUT,
     PAGE_DISPLAYS,
@@ -391,13 +401,14 @@ enum {
 };
 
 static const char *PAGE_NAMES[PAGE_COUNT] = {
-    "Keybindings", "Startup Apps", "Window Rules", "Input",
+    "Keybindings", "Startup Apps", "Default Apps", "Window Rules", "Input",
     "Displays", "Session", "About",
 };
 
 static const char *PAGE_SUBS[PAGE_COUNT] = {
     "Every shortcut jtlabwc listens for",
     "Programs launched together with your session",
+    "Handlers for links, files, media and the terminal",
     "Match windows and shape how they appear",
     "Pointer, touchpad and keyboard behaviour",
     "Outputs, resolution, refresh rate and scale",
@@ -463,7 +474,10 @@ enum {
     HIT_DISP_ORIENT,
     HIT_DISP_ENABLE,
     HIT_DISP_PRIMARY,
-    HIT_DISP_MODE
+    HIT_DISP_MODE,
+    HIT_APP_FIELD,
+    HIT_APP_PICK,
+    HIT_APP_PICKER_CLOSE
 };
 
 enum {
@@ -497,6 +511,48 @@ static Hit g_hits[MAX_HITS];
 static int g_hit_count;
 
 typedef struct {
+    const char *key;
+    const char *label;
+    const char *desc;
+    const char *mimes[4];
+    int mime_count;
+    const char *preferred;
+    int terminal;
+} AppCategory;
+
+static const AppCategory APP_CATEGORIES[] = {
+    { "terminal", "Terminal", "Used by Super + Return",
+      { NULL }, 0, "footclient.desktop", 1 },
+    { "browser", "Web browser", "HTTP links and HTML pages",
+      { "text/html", "x-scheme-handler/http", "x-scheme-handler/https" },
+      3, "vivaldi-stable.desktop", 0 },
+    { "filemanager", "File manager", "Folders and mounted drives",
+      { "inode/directory" }, 1, "nemo.desktop", 0 },
+    { "texteditor", "Text editor", "Plain text and source files",
+      { "text/plain" }, 1, "nvim.desktop", 0 },
+    { "image", "Image viewer", "Photos and pictures",
+      { "image/png", "image/jpeg" }, 2, "viewnior.desktop", 0 },
+    { "video", "Video player", "Movies and clips",
+      { "video/mp4", "video/x-matroska" }, 2, "mpv.desktop", 0 },
+    { "audio", "Music player", "Audio tracks and playlists",
+      { "audio/mpeg", "audio/flac" }, 2, "mpv.desktop", 0 },
+    { "pdf", "PDF viewer", "Portable documents",
+      { "application/pdf" }, 1, "org.pwmt.zathura.desktop", 0 },
+};
+#define APP_CAT_COUNT ((int)(sizeof APP_CATEGORIES / sizeof APP_CATEGORIES[0]))
+
+typedef struct {
+    char id[APP_ID_MAX];
+    char name[APP_NAME_MAX];
+    char exec[APP_EXEC_MAX];
+    char mimes[APP_MIMES_MAX];
+} DesktopApp;
+
+static DesktopApp g_desktop_apps[MAX_DESKTOP_APPS];
+static int g_desktop_app_count;
+static char g_default_apps[APP_CAT_COUNT][APP_ID_MAX];
+
+typedef struct {
     int page;
     double t;
     int toggles[TOG_COUNT];
@@ -522,6 +578,9 @@ typedef struct {
     int pos_layout_valid;
     int mode_picker_open;
     int mode_picker_head;
+    int app_picker_open;
+    int app_picker_cat;
+    int app_picker_scroll;
     int disp_scroll;
     int disp_drag;
     double disp_drag_ox;
@@ -604,6 +663,12 @@ static void keybinds_save(void);
 static void terminal_input_commit(void);
 static void terminal_input_cancel(void);
 
+/* Default app discovery and persistence, defined with the config code. */
+static void defaultapps_mark_dirty(void);
+static void defaultapps_load(void);
+static void defaultapps_save(void);
+static void defaultapps_choose(int cat, int candidate);
+
 static void ui_toast(const char *msg)
 {
     snprintf(g_ui.toast, sizeof g_ui.toast, "%s", msg);
@@ -623,6 +688,9 @@ static void ui_init(void)
     g_ui.pos_layout_valid = 0;
     g_ui.mode_picker_open = 0;
     g_ui.mode_picker_head = -1;
+    g_ui.app_picker_open = 0;
+    g_ui.app_picker_cat = -1;
+    g_ui.app_picker_scroll = 0;
     g_ui.disp_scroll = 0;
     g_ui.disp_drag = -1;
     g_ui.disp_drag_ox = 0.0;
@@ -676,6 +744,9 @@ static void ui_init(void)
 
     /* Default terminal command; falls back to footclient. */
     (void)keybinds_load();
+
+    /* Installed application desktop files and XDG defaults. */
+    defaultapps_load();
 }
 
 /* ---- display helpers --------------------------------------------- */
@@ -1407,6 +1478,18 @@ static void paint_nav_icon(cairo_t *cr, int page, double x, double y,
                 cairo_stroke(cr);
             }
         break;
+    case PAGE_DEFAULT_APPS:
+        rounded_rect(cr, x + 1.5, y + 2.0, 15.0, 14.0, 3.0);
+        cairo_stroke(cr);
+        cairo_new_path(cr);
+        cairo_arc(cr, x + 6.0, y + 9.0, 2.2, 0.0, 2.0 * PI);
+        cairo_stroke(cr);
+        cairo_move_to(cr, x + 11.5, y + 6.0);
+        cairo_line_to(cr, x + 14.0, y + 6.0);
+        cairo_move_to(cr, x + 11.5, y + 10.0);
+        cairo_line_to(cr, x + 14.0, y + 10.0);
+        cairo_stroke(cr);
+        break;
     case PAGE_RULES:
         rounded_rect(cr, x + 1.0, y + 2.0, 16.0, 14.0, 2.5);
         cairo_stroke(cr);
@@ -1997,7 +2080,8 @@ static int kb_filtered_count(void)
 
 static void kb_geom(double *ty, double *th, double *view_h)
 {
-    *ty = 182.0;
+    /* Leave a gap below the search bar before the list box begins. */
+    *ty = 164.0;
     *th = WIN_H - KB_BOTTOM_GAP - *ty;
     *view_h = *th - KB_HEADER_H;
 }
@@ -2050,55 +2134,6 @@ static void page_keybindings(cairo_t *cr)
         paint_chip(cr, KB_FILTERS[i], cx, 110.0, i == active_filter);
         cx += w + 8.0;
     }
-
-    /* Default terminal command, used by the Super+Return binding. */
-    double term_y = 140.0, term_h = 30.0;
-    double field_x = CONTENT_X + 112.0, field_w = 360.0;
-    int term_idx = add_hit(HIT_TERM_FIELD, 0, 0,
-                           field_x, term_y, field_w, term_h);
-    int term_hot = hit_hover(term_idx);
-
-    text_draw(cr, "Default terminal", 9.5, 500, C_DIM, 0.9,
-              CONTENT_X, term_y + 9.0, ALIGN_LEFT, 0.1);
-
-    rgba(cr, C_TRACK, 0.9);
-    rounded_rect(cr, field_x, term_y, field_w, term_h, 7.0);
-    cairo_fill(cr);
-    rgba(cr, g_ui.terminal_editing ? C_ACCENT : C_BORDER,
-         g_ui.terminal_editing ? 0.85 : (term_hot ? 0.7 : 0.5));
-    cairo_set_line_width(cr, 1.0);
-    rounded_rect(cr, field_x + 0.5, term_y + 0.5, field_w - 1.0,
-                 term_h - 1.0, 6.5);
-    cairo_stroke(cr);
-
-    cairo_save(cr);
-    cairo_rectangle(cr, field_x + 1.0, term_y + 1.0,
-                    field_w - 2.0, term_h - 2.0);
-    cairo_clip(cr);
-    if (g_ui.terminal_editing) {
-        const char *input = g_ui.terminal_input;
-        text_draw(cr, input, 10.5, 500, C_FG, 0.95,
-                  field_x + 12.0, term_y + 8.0, ALIGN_LEFT, 0.1);
-        if ((int)(g_ui.t * 2.0) % 2 == 0) {
-            double caret = field_x + 12.0 +
-                text_width(cr, input, 10.5, 500, 0.1) + 2.0;
-            rgba(cr, C_ACCENT, 0.9);
-            cairo_set_line_width(cr, 1.2);
-            cairo_move_to(cr, caret, term_y + 7.0);
-            cairo_line_to(cr, caret, term_y + 23.0);
-            cairo_stroke(cr);
-        }
-    } else {
-        text_draw(cr, g_ui.terminal, 10.5, 500, C_FG, 0.95,
-                  field_x + 12.0, term_y + 8.0, ALIGN_LEFT, 0.1);
-    }
-    cairo_restore(cr);
-
-    text_draw(cr,
-              g_ui.terminal_editing ? "Enter to save · Esc to cancel"
-                                    : "Super + Return",
-              8.5, 500, C_FAINT, 0.8, field_x + field_w + 14.0,
-              term_y + 10.0, ALIGN_LEFT, 0.2);
 
     double tx = CONTENT_X, ty, th, view_h;
     kb_geom(&ty, &th, &view_h);
@@ -2620,9 +2655,510 @@ terminal_input_commit(void)
     if (*cmd)
         snprintf(g_ui.terminal, sizeof g_ui.terminal, "%s", cmd);
     terminal_input_cancel();
+    g_default_apps[0][0] = '\0';
     keybinds_save();
+    defaultapps_save();
     jtlabwc_reload();
     ui_toast("Default terminal saved");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Default apps                                                       */
+/* ------------------------------------------------------------------ */
+
+static int
+defaultapps_valid_id(const char *s)
+{
+    if (!s || !*s)
+        return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' ||
+            *p == '@' || *p == '+')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static void
+defaultapps_config_path(char *buf, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(buf, n, "%s/.config/jt/%s", home, DEFAULT_APPS_FILE);
+}
+
+static void
+defaultapps_clean_exec(char *exec)
+{
+    char *out = exec;
+    for (char *p = exec; *p; p++) {
+        if (*p == '%' && p[1]) {
+            p++;
+            continue;
+        }
+        *out++ = *p;
+    }
+    *out = '\0';
+    char *t = startup_trim(exec);
+    if (t != exec)
+        memmove(exec, t, strlen(t) + 1);
+}
+
+static int
+defaultapps_parse_desktop(const char *path, DesktopApp *d)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+
+    int nodisplay = 0, hidden = 0, type_ok = 0;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *s = startup_trim(line);
+        if (!*s || *s == '#')
+            continue;
+        char *eq = strchr(s, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        const char *key = startup_trim(s);
+        char *value = startup_trim(eq + 1);
+
+        if (!strcmp(key, "Name") && *value)
+            snprintf(d->name, sizeof d->name, "%s", value);
+        else if (!strcmp(key, "Exec") && *value)
+            snprintf(d->exec, sizeof d->exec, "%s", value);
+        else if (!strcmp(key, "MimeType") && *value)
+            snprintf(d->mimes, sizeof d->mimes, "%s", value);
+        else if (!strcmp(key, "Type"))
+            type_ok = !strcmp(value, "Application");
+        else if (!strcmp(key, "NoDisplay"))
+            nodisplay = !strcasecmp(value, "true");
+        else if (!strcmp(key, "Hidden"))
+            hidden = !strcasecmp(value, "true");
+    }
+    fclose(f);
+
+    if (!type_ok || nodisplay || hidden || !d->name[0] || !d->exec[0])
+        return 0;
+    defaultapps_clean_exec(d->exec);
+    return 1;
+}
+
+static void
+defaultapps_scan_dir(const char *dir)
+{
+    DIR *dp = opendir(dir);
+    if (!dp)
+        return;
+
+    struct dirent *de;
+    while ((de = readdir(dp))) {
+        size_t len = strlen(de->d_name);
+        if (len < 9 || strcmp(de->d_name + len - 8, ".desktop"))
+            continue;
+        if (!defaultapps_valid_id(de->d_name))
+            continue;
+
+        int duplicate = 0;
+        for (int i = 0; i < g_desktop_app_count; i++) {
+            if (!strcmp(g_desktop_apps[i].id, de->d_name)) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate || g_desktop_app_count >= MAX_DESKTOP_APPS)
+            continue;
+
+        char path[768];
+        snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        DesktopApp d;
+        memset(&d, 0, sizeof d);
+        snprintf(d.id, sizeof d.id, "%s", de->d_name);
+        if (defaultapps_parse_desktop(path, &d))
+            g_desktop_apps[g_desktop_app_count++] = d;
+    }
+    closedir(dp);
+}
+
+static void
+defaultapps_scan(void)
+{
+    memset(g_desktop_apps, 0, sizeof g_desktop_apps);
+    g_desktop_app_count = 0;
+
+    defaultapps_scan_dir("/usr/local/share/applications");
+    defaultapps_scan_dir("/usr/share/applications");
+
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char dir[512];
+        snprintf(dir, sizeof dir, "%s/.local/share/applications", home);
+        defaultapps_scan_dir(dir);
+    }
+
+    const char *data_dirs = getenv("XDG_DATA_DIRS");
+    if (data_dirs && *data_dirs) {
+        char copy[2048];
+        snprintf(copy, sizeof copy, "%s", data_dirs);
+        char *save = NULL;
+        for (char *item = strtok_r(copy, ":", &save); item;
+             item = strtok_r(NULL, ":", &save)) {
+            char dir[640];
+            snprintf(dir, sizeof dir, "%s/applications", item);
+            defaultapps_scan_dir(dir);
+        }
+    }
+}
+
+static int
+defaultapps_app_index(const char *id)
+{
+    if (!id || !*id)
+        return -1;
+    for (int i = 0; i < g_desktop_app_count; i++)
+        if (!strcmp(g_desktop_apps[i].id, id))
+            return i;
+    return -1;
+}
+
+static int
+defaultapps_matches(int cat, const DesktopApp *d)
+{
+    if (cat < 0 || cat >= APP_CAT_COUNT || !d)
+        return 0;
+
+    const AppCategory *c = &APP_CATEGORIES[cat];
+    if (c->terminal) {
+        if (strcasestr(d->id, "server"))
+            return 0;
+        static const char *const hints[] = {
+            "terminal", "term", "foot", "kitty", "alacritty",
+            "wezterm", "xterm", "konsole", "ghostty", NULL
+        };
+        char hay[APP_ID_MAX + APP_NAME_MAX + APP_EXEC_MAX];
+        snprintf(hay, sizeof hay, "%s %s %s", d->id, d->name, d->exec);
+        for (int i = 0; hints[i]; i++)
+            if (strcasestr(hay, hints[i]))
+                return 1;
+        return 0;
+    }
+
+    for (int i = 0; i < c->mime_count; i++)
+        if (c->mimes[i] && strstr(d->mimes, c->mimes[i]))
+            return 1;
+    return 0;
+}
+
+static int
+defaultapps_candidates(int cat, int *out, int max)
+{
+    int n = 0;
+    if (cat < 0 || cat >= APP_CAT_COUNT)
+        return 0;
+
+    int pref = defaultapps_app_index(APP_CATEGORIES[cat].preferred);
+    if (pref >= 0 && defaultapps_matches(cat, &g_desktop_apps[pref]) && n < max)
+        out[n++] = pref;
+
+    for (int i = 0; i < g_desktop_app_count && n < max; i++) {
+        if (i == pref || !defaultapps_matches(cat, &g_desktop_apps[i]))
+            continue;
+        out[n++] = i;
+    }
+    return n;
+}
+
+static void
+defaultapps_query_id(const char *command, char *out, size_t n)
+{
+    out[0] = '\0';
+    FILE *p = popen(command, "r");
+    if (!p)
+        return;
+    char line[APP_ID_MAX + 64];
+    if (fgets(line, sizeof line, p)) {
+        char *s = startup_trim(line);
+        if (defaultapps_valid_id(s))
+            snprintf(out, n, "%s", s);
+    }
+    pclose(p);
+}
+
+static void
+defaultapps_load(void)
+{
+    defaultapps_scan();
+    memset(g_default_apps, 0, sizeof g_default_apps);
+
+    for (int i = 1; i < APP_CAT_COUNT; i++) {
+        if (APP_CATEGORIES[i].mime_count) {
+            char cmd[320];
+            snprintf(cmd, sizeof cmd, "xdg-mime query default %s 2>/dev/null",
+                     APP_CATEGORIES[i].mimes[0]);
+            defaultapps_query_id(cmd, g_default_apps[i],
+                                 sizeof g_default_apps[i]);
+        }
+        if (i == 1) {
+            defaultapps_query_id(
+                "xdg-settings get default-web-browser 2>/dev/null",
+                g_default_apps[i], sizeof g_default_apps[i]);
+        }
+    }
+
+    char path[512];
+    defaultapps_config_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char *s = startup_trim(line);
+        if (!*s || *s == '#')
+            continue;
+        char *eq = strchr(s, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        char *key = startup_trim(s);
+        char *value = startup_trim(eq + 1);
+        if (!defaultapps_valid_id(value))
+            continue;
+        for (int i = 0; i < APP_CAT_COUNT; i++) {
+            if (!strcmp(key, APP_CATEGORIES[i].key)) {
+                snprintf(g_default_apps[i], sizeof g_default_apps[i],
+                         "%s", value);
+                break;
+            }
+        }
+    }
+    fclose(f);
+}
+
+static void
+defaultapps_save(void)
+{
+    char path[512];
+    defaultapps_config_path(path, sizeof path);
+    startup_mkdirs(path);
+
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# jtsettings default applications\n");
+    fprintf(f, "# Written by jtsettings; XDG handlers are updated live.\n");
+    for (int i = 0; i < APP_CAT_COUNT; i++)
+        if (g_default_apps[i][0])
+            fprintf(f, "%s=%s\n", APP_CATEGORIES[i].key, g_default_apps[i]);
+    fclose(f);
+}
+
+static void
+defaultapps_selected_name(int cat, char *buf, size_t n)
+{
+    if (cat < 0 || cat >= APP_CAT_COUNT) {
+        snprintf(buf, n, "Not set");
+        return;
+    }
+    if (cat == 0 && !g_default_apps[0][0]) {
+        snprintf(buf, n, "%s", g_ui.terminal);
+        return;
+    }
+    if (!g_default_apps[cat][0]) {
+        snprintf(buf, n, "Not set");
+        return;
+    }
+    int idx = defaultapps_app_index(g_default_apps[cat]);
+    if (idx >= 0 && g_desktop_apps[idx].name[0])
+        snprintf(buf, n, "%s", g_desktop_apps[idx].name);
+    else
+        snprintf(buf, n, "%s", g_default_apps[cat]);
+}
+
+static void
+defaultapps_choose(int cat, int candidate)
+{
+    if (cat < 0 || cat >= APP_CAT_COUNT)
+        return;
+
+    if (candidate < 0) {
+        g_ui.app_picker_open = 0;
+        g_ui.terminal_editing = 1;
+        snprintf(g_ui.terminal_input, sizeof g_ui.terminal_input,
+                 "%s", g_ui.terminal);
+        defaultapps_mark_dirty();
+        return;
+    }
+
+    int ids[MAX_DESKTOP_APPS];
+    int count = defaultapps_candidates(cat, ids, MAX_DESKTOP_APPS);
+    if (candidate >= count)
+        return;
+
+    const DesktopApp *d = &g_desktop_apps[ids[candidate]];
+    char id[APP_ID_MAX];
+    snprintf(id, sizeof id, "%s", d->id);
+    if (!defaultapps_valid_id(id))
+        return;
+
+    g_ui.app_picker_open = 0;
+
+    if (cat == 0) {
+        char cmd[APP_EXEC_MAX];
+        snprintf(cmd, sizeof cmd, "%s", d->exec);
+        defaultapps_clean_exec(cmd);
+        if (!cmd[0])
+            return;
+        snprintf(g_ui.terminal, sizeof g_ui.terminal, "%s", cmd);
+        snprintf(g_default_apps[0], sizeof g_default_apps[0], "%s", id);
+        keybinds_save();
+        defaultapps_save();
+        jtlabwc_reload();
+        ui_toast("Default apps saved");
+        defaultapps_mark_dirty();
+        return;
+    }
+
+    char cmd[1024];
+    size_t used = snprintf(cmd, sizeof cmd, "xdg-mime default %s", id);
+    for (int i = 0; i < APP_CATEGORIES[cat].mime_count &&
+                    used < sizeof cmd; i++)
+        used += (size_t)snprintf(cmd + used, sizeof cmd - used, " %s",
+                                 APP_CATEGORIES[cat].mimes[i]);
+    snprintf(cmd + used, sizeof cmd - used, " >/dev/null 2>&1");
+
+    int ok = system(cmd) == 0;
+    if (cat == 1) {
+        char browser_cmd[512];
+        snprintf(browser_cmd, sizeof browser_cmd,
+                 "xdg-settings set default-web-browser %s >/dev/null 2>&1", id);
+        if (system(browser_cmd) != 0) { }
+    }
+
+    if (!ok) {
+        ui_toast("Could not set that default app");
+        defaultapps_mark_dirty();
+        return;
+    }
+
+    snprintf(g_default_apps[cat], sizeof g_default_apps[cat], "%s", id);
+    defaultapps_save();
+    ui_toast("Default apps saved");
+    defaultapps_mark_dirty();
+}
+
+static void
+app_picker_rect(double *px, double *py, double *pw, double *ph)
+{
+    int cat = g_ui.app_picker_cat;
+    int ids[MAX_DESKTOP_APPS];
+    int count = (cat >= 0 && cat < APP_CAT_COUNT)
+        ? defaultapps_candidates(cat, ids, MAX_DESKTOP_APPS) : 0;
+    int rows = count > 10 ? 10 : count;
+    if (cat == 0)
+        rows++;
+
+    *pw = 560.0;
+    *ph = 116.0 + rows * 36.0 + 56.0;
+    *px = (WIN_W - *pw) / 2.0;
+    *py = (WIN_H - *ph) / 2.0;
+}
+
+static void
+paint_app_picker(cairo_t *cr)
+{
+    if (!g_ui.app_picker_open)
+        return;
+    int cat = g_ui.app_picker_cat;
+    if (cat < 0 || cat >= APP_CAT_COUNT) {
+        g_ui.app_picker_open = 0;
+        return;
+    }
+
+    int ids[MAX_DESKTOP_APPS];
+    int count = defaultapps_candidates(cat, ids, MAX_DESKTOP_APPS);
+    int max_rows = count > 10 ? 10 : count;
+    int custom = cat == 0;
+    if (custom)
+        max_rows++;
+
+    double px, py, pw, ph;
+    app_picker_rect(&px, &py, &pw, &ph);
+
+    rgba(cr, 0x000000, 0.58);
+    cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
+    cairo_fill(cr);
+    paint_card(cr, px, py, pw, ph);
+
+    text_draw(cr, APP_CATEGORIES[cat].label, 16.0, 700, C_FG, 0.98,
+              px + 22.0, py + 18.0, ALIGN_LEFT, 0.0);
+    text_draw(cr, "Select a detected application", 9.5, 400, C_DIM, 0.8,
+              px + 22.0, py + 44.0, ALIGN_LEFT, 0.1);
+
+    if (count == 0 && !custom) {
+        text_draw(cr, "No matching applications were found.", 10.0, 400,
+                  C_DIM, 0.85, px + 22.0, py + 84.0, ALIGN_LEFT, 0.1);
+    }
+
+    int shown = 0;
+    for (int i = 0; i < max_rows; i++) {
+        double ry = py + 76.0 + i * 36.0;
+        int is_custom = custom && i == count;
+        if (is_custom) {
+            int idx = add_hit(HIT_APP_PICK, cat, -1,
+                              px + 16.0, ry, pw - 32.0, 32.0);
+            int hot = hit_hover(idx);
+            rgba(cr, hot ? C_TRACK : C_CARD, hot ? 0.95 : 0.8);
+            rounded_rect(cr, px + 16.0, ry, pw - 32.0, 32.0, 7.0);
+            cairo_fill(cr);
+            text_draw(cr, "Custom command…", 10.5, 500, C_FG, 0.92,
+                      px + 30.0, ry + 9.0, ALIGN_LEFT, 0.1);
+            shown++;
+            continue;
+        }
+        if (i >= count)
+            continue;
+
+        const DesktopApp *d = &g_desktop_apps[ids[i]];
+        int on = !strcmp(g_default_apps[cat], d->id);
+        if (cat == 0 && !g_default_apps[0][0] &&
+            !strcmp(g_ui.terminal, d->exec))
+            on = 1;
+        int idx = add_hit(HIT_APP_PICK, cat, i,
+                          px + 16.0, ry, pw - 32.0, 32.0);
+        int hot = hit_hover(idx);
+
+        rgba(cr, on ? C_ACCENT : C_TRACK, on ? 0.16 : (hot ? 0.9 : 0.7));
+        rounded_rect(cr, px + 16.0, ry, pw - 32.0, 32.0, 7.0);
+        cairo_fill(cr);
+        rgba(cr, on ? C_ACCENT : C_BORDER, on ? 0.65 : 0.32);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, px + 16.5, ry + 0.5, pw - 33.0, 31.0, 6.5);
+        cairo_stroke(cr);
+
+        text_draw(cr, d->name, 10.5, 500, on ? C_ACCENT : C_FG,
+                  on ? 1.0 : 0.92, px + 30.0, ry + 8.0, ALIGN_LEFT, 0.1);
+        text_draw(cr, d->id, 8.5, 400, C_FAINT, 0.75,
+                  px + pw - 30.0, ry + 9.0, ALIGN_RIGHT, 0.1);
+        shown++;
+    }
+    (void)shown;
+
+    double bx = px + pw - 22.0 - 92.0;
+    double by = py + ph - 20.0 - 32.0;
+    int close_idx = add_hit(HIT_APP_PICKER_CLOSE, 0, 0, bx, by, 92.0, 32.0);
+    int close_hot = hit_hover(close_idx);
+    rgba(cr, close_hot ? C_TRACK : C_CARD, 0.95);
+    rounded_rect(cr, bx, by, 92.0, 32.0, 7.0);
+    cairo_fill(cr);
+    rgba(cr, C_BORDER, 0.45);
+    cairo_set_line_width(cr, 1.0);
+    rounded_rect(cr, bx + 0.5, by + 0.5, 91.0, 31.0, 6.5);
+    cairo_stroke(cr);
+    text_draw(cr, "Cancel", 10.0, 500, C_DIM, 0.9,
+              bx + 46.0, by + 9.0, ALIGN_CENTER, 0.2);
 }
 
 static void
@@ -2843,6 +3379,86 @@ static void page_startup(cairo_t *cr)
               col2 + 18.0, by + 32.0, ALIGN_LEFT, 0.2);
     text_draw(cr, "Changes are written immediately", 8.5, 400, C_DIM, 0.75,
               col2 + 18.0, by + 50.0, ALIGN_LEFT, 0.1);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Page: Default Apps                                                 */
+/* ------------------------------------------------------------------ */
+
+static void page_defaultapps(cairo_t *cr)
+{
+    section_label(cr, "DEFAULT APPS", CONTENT_X, 102.0);
+    text_draw(cr, "Choose the applications jtlab and your desktop open by default",
+              9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
+
+    double y = 130.0;
+    double row_h = 58.0;
+    double gap = 6.0;
+    double field_w = 292.0;
+    double field_x = CONTENT_X + CONTENT_W - field_w - 20.0;
+
+    for (int i = 0; i < APP_CAT_COUNT; i++) {
+        double ry = y + i * (row_h + gap);
+        paint_card(cr, CONTENT_X, ry, CONTENT_W, row_h);
+
+        text_draw(cr, APP_CATEGORIES[i].label, 12.0, 600, C_FG, 0.96,
+                  CONTENT_X + 20.0, ry + 12.0, ALIGN_LEFT, 0.1);
+        text_draw(cr, APP_CATEGORIES[i].desc, 8.8, 400, C_DIM, 0.75,
+                  CONTENT_X + 20.0, ry + 33.0, ALIGN_LEFT, 0.1);
+
+        int idx = add_hit(HIT_APP_FIELD, i, 0,
+                          field_x, ry + 11.0, field_w, 36.0);
+        int hot = hit_hover(idx);
+
+        rgba(cr, C_TRACK, 0.9);
+        rounded_rect(cr, field_x, ry + 11.0, field_w, 36.0, 7.0);
+        cairo_fill(cr);
+        rgba(cr, hot ? C_ACCENT : C_BORDER, hot ? 0.75 : 0.5);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, field_x + 0.5, ry + 11.5, field_w - 1.0, 35.0, 6.5);
+        cairo_stroke(cr);
+
+        cairo_save(cr);
+        cairo_rectangle(cr, field_x + 1.0, ry + 12.0,
+                        field_w - 2.0, 34.0);
+        cairo_clip(cr);
+        if (i == 0 && g_ui.terminal_editing) {
+            const char *input = g_ui.terminal_input;
+            text_draw(cr, input, 10.5, 500, C_FG, 0.95,
+                      field_x + 12.0, ry + 20.0, ALIGN_LEFT, 0.1);
+            if ((int)(g_ui.t * 2.0) % 2 == 0) {
+                double caret = field_x + 12.0 +
+                    text_width(cr, input, 10.5, 500, 0.1) + 2.0;
+                rgba(cr, C_ACCENT, 0.9);
+                cairo_set_line_width(cr, 1.2);
+                cairo_move_to(cr, caret, ry + 19.0);
+                cairo_line_to(cr, caret, ry + 35.0);
+                cairo_stroke(cr);
+            }
+        } else {
+            char name[APP_NAME_MAX + APP_ID_MAX];
+            defaultapps_selected_name(i, name, sizeof name);
+            text_draw(cr, name, 10.5, 500, C_FG, 0.94,
+                      field_x + 12.0, ry + 20.0, ALIGN_LEFT, 0.1);
+        }
+        cairo_restore(cr);
+
+        rgba(cr, C_DIM, 0.85);
+        double cx = field_x + field_w - 18.0;
+        double cy = ry + 29.0;
+        cairo_set_line_width(cr, 1.4);
+        cairo_move_to(cr, cx - 4.0, cy - 2.5);
+        cairo_line_to(cr, cx, cy + 2.0);
+        cairo_line_to(cr, cx + 4.0, cy - 2.5);
+        cairo_stroke(cr);
+    }
+
+    text_wrap(cr,
+        "Defaults are applied through XDG and stored in "
+        "~/.config/jt/defaultapps.conf. The terminal is also written to "
+        "keybinds.conf for Super + Return.",
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, y + APP_CAT_COUNT * (row_h + gap) + 6.0,
+        CONTENT_W, 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3508,6 +4124,7 @@ static void paint_content(cairo_t *cr)
     switch (g_ui.page) {
     case PAGE_KEYBINDINGS: page_keybindings(cr); break;
     case PAGE_STARTUP: page_startup(cr); break;
+    case PAGE_DEFAULT_APPS: page_defaultapps(cr); break;
     case PAGE_RULES: page_rules(cr); break;
     case PAGE_INPUT: page_input(cr); break;
     case PAGE_DISPLAYS: page_displays(cr); break;
@@ -3519,6 +4136,7 @@ static void paint_content(cairo_t *cr)
     paint_footer(cr);
     paint_position_editor(cr);
     paint_mode_picker(cr);
+    paint_app_picker(cr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3605,6 +4223,12 @@ struct App {
     char ctl_buf[256];
     size_t ctl_len;
 };
+
+static void defaultapps_mark_dirty(void)
+{
+    if (g_app)
+        g_app->dirty = 1;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Remembered window state                                            */
@@ -4588,12 +5212,20 @@ static void ui_activate(App *a, int idx)
         break;
     }
 
-    case HIT_TERM_FIELD:
-        if (!g_ui.terminal_editing) {
-            g_ui.terminal_editing = 1;
-            snprintf(g_ui.terminal_input, sizeof g_ui.terminal_input,
-                     "%s", g_ui.terminal);
-        }
+    case HIT_APP_FIELD:
+        g_ui.mode_picker_open = 0;
+        g_ui.pos_editor_open = 0;
+        g_ui.app_picker_cat = h->a;
+        g_ui.app_picker_scroll = 0;
+        g_ui.app_picker_open = 1;
+        g_ui.hover = -1;
+        g_ui.pressed = -1;
+        break;
+    case HIT_APP_PICK:
+        defaultapps_choose(h->a, h->b);
+        break;
+    case HIT_APP_PICKER_CLOSE:
+        g_ui.app_picker_open = 0;
         break;
     case HIT_BUTTON:
         if (h->a == BTN_START_ADD) {
@@ -4724,6 +5356,13 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
         return;
     }
 
+    if (g_ui.app_picker_open) {
+        g_ui.hover = hit_at(g_ui.pointer_x, g_ui.pointer_y);
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
     if (g_ui.pos_editor_open) {
         if (g_ui.disp_drag >= 0 && g_ui.pos_scale > 0.0) {
             Head *h = head_get(g_ui.disp_drag);
@@ -4800,6 +5439,30 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
                 if (!h || x < px || x > px + pw ||
                     y < py || y > py + ph)
                     g_ui.mode_picker_open = 0;
+            }
+        }
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.app_picker_open) {
+        if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            int idx = hit_at(x, y);
+            int handled = 0;
+            if (idx >= 0) {
+                Hit *hh = &g_hits[idx];
+                if (hh->kind == HIT_APP_PICK ||
+                    hh->kind == HIT_APP_PICKER_CLOSE) {
+                    ui_activate(a, idx);
+                    handled = 1;
+                }
+            }
+            if (!handled) {
+                double px = 0.0, py = 0.0, pw = 0.0, ph = 0.0;
+                app_picker_rect(&px, &py, &pw, &ph);
+                if (x < px || x > px + pw || y < py || y > py + ph)
+                    g_ui.app_picker_open = 0;
             }
         }
         a->dirty = 1;
@@ -5100,8 +5763,13 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
         return;
     }
 
+    if (g_ui.app_picker_open && sym == XKB_KEY_Escape) {
+        g_ui.app_picker_open = 0;
+        return;
+    }
+
     /* The default terminal field owns the keyboard while it is open. */
-    if (g_ui.page == PAGE_KEYBINDINGS && g_ui.terminal_editing) {
+    if (g_ui.page == PAGE_DEFAULT_APPS && g_ui.terminal_editing) {
         int r = text_input_key(a, key, sym, g_ui.terminal_input,
                                sizeof g_ui.terminal_input);
         if (r == 2)
@@ -5376,6 +6044,9 @@ static int page_from_name(const char *s)
     if (!strcasecmp(s, "startup") || !strcasecmp(s, "startup apps") ||
         !strcasecmp(s, "autostart"))
         return PAGE_STARTUP;
+    if (!strcasecmp(s, "apps") || !strcasecmp(s, "default apps") ||
+        !strcasecmp(s, "defaults") || !strcasecmp(s, "default"))
+        return PAGE_DEFAULT_APPS;
     if (!strcasecmp(s, "rules") || !strcasecmp(s, "window rules"))
         return PAGE_RULES;
     if (!strcasecmp(s, "input") || !strcasecmp(s, "mouse") ||
@@ -5812,7 +6483,7 @@ static void usage(const char *argv0)
         "usage: %s [#RRGGBB] [--accent #RRGGBB] [--page NAME]\n"
         "       %s --screenshot FILE [--page NAME]\n"
         "\n"
-        "Pages: keybindings, startup, rules, input,\n"
+        "Pages: keybindings, startup, apps, rules, input,\n"
         "       displays, session, about\n",
         argv0, argv0);
 }
