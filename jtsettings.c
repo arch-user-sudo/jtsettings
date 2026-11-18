@@ -474,12 +474,16 @@ enum {
     BTN_REBOOT,
     BTN_SHUTDOWN,
     BTN_START_ADD,
-    BTN_START_REMOVE_FIRST,   /* + row index */
     BTN_POSITION,
     BTN_POS_DONE,
     BTN_DISPLAYS_APPLY,
     BTN_DISPLAYS_RESET,
-    BTN_MODE_CLOSE
+    BTN_MODE_CLOSE,
+
+    /* Dynamic IDs must come after every fixed button ID; otherwise a
+     * startup Remove button can swallow an unrelated button press. */
+    BTN_START_REMOVE_FIRST,   /* + row index */
+    BTN_START_REMOVE_LAST = BTN_START_REMOVE_FIRST + STARTUP_MAX - 1
 };
 
 typedef struct {
@@ -4602,6 +4606,7 @@ static void ui_activate(App *a, int idx)
             break;
         }
         if (h->a >= BTN_START_REMOVE_FIRST &&
+            h->a <= BTN_START_REMOVE_LAST &&
             h->a < BTN_START_REMOVE_FIRST + g_startup_count) {
             startup_remove(h->a - BTN_START_REMOVE_FIRST);
             ui_toast("Startup application removed");
