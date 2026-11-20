@@ -1,5 +1,5 @@
 CC ?= cc
-PKGS = cairo pangocairo wayland-client xkbcommon
+PKGS = cairo pangocairo wayland-client xkbcommon gio-2.0 gdk-pixbuf-2.0 libsoup-3.0
 CFLAGS ?= -march=native -O2 -g -std=c11 -Wall -Wextra -flto -s
 CFLAGS += $(shell pkg-config --cflags $(PKGS))
 LDLIBS = $(shell pkg-config --libs $(PKGS)) -lm

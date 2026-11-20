@@ -11,11 +11,13 @@
  *   ./jtstartup                    (run the saved startup apps)
  *
  * Most of this is a GUI preview: controls are drawn and react locally, but
- * only the Startup Apps page writes a file.  It saves the enabled entries and
- * launch delay to ~/.config/jt/startup.conf, which jtstartup reads at session
- * start.  Everything else stays local.  The left panel mirrors the areas a
- * real settings app would cover: keybindings, startup apps, window rules,
- * input, displays, session behaviour and an about page.
+ * Startup Apps writes ~/.config/jt/startup.conf (read by jtstartup) and the
+ * new Profile page writes ~/.config/jt/profile.config (read by JTLab).  The
+ * Profile tab picks the weather location and temperature unit, and chooses a
+ * profile photo through the XDG file-chooser portal with a zoom step before
+ * the choice is saved.  The left panel mirrors the areas a real settings app
+ * would cover: keybindings, startup apps, window rules, input, displays,
+ * session behaviour, profile and an about page.
  *
  * The palette and typography follow ~/JTLab/config.h: #030303 background,
  * #404040 borders, #E8A03C amber accent by default, #66B366 success green,
@@ -28,6 +30,9 @@
 
 #include <cairo/cairo.h>
 #include <pango/pangocairo.h>
+#include <gio/gio.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <libsoup/soup.h>
 
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
@@ -94,6 +99,17 @@ static double WIN_H = DESIGN_H;
 #define APP_EXEC_MAX     256
 #define APP_MIMES_MAX    1024
 #define DEFAULT_APPS_FILE "defaultapps.conf"
+
+/* Profile page: the file is shared with JTLab, which re-reads it when we send
+ * "reload" to its control socket. */
+#define PROFILE_CONFIG_FILE "profile.config"
+#define PROFILE_PATH_MAX    512
+#define WX_LOC_MAX          96
+#define WX_QUERY_MAX        96
+#define WX_RESULTS          6
+#define WX_RESULT_NAME_MAX  128
+#define PROFILE_ZOOM_MIN    1.0
+#define PROFILE_ZOOM_MAX    4.0
 
 #define C_BG        0x030303
 #define C_BG_TOP    0x070708
@@ -404,13 +420,14 @@ enum {
     PAGE_INPUT,
     PAGE_DISPLAYS,
     PAGE_SESSION,
+    PAGE_PROFILE,
     PAGE_ABOUT,
     PAGE_COUNT
 };
 
 static const char *PAGE_NAMES[PAGE_COUNT] = {
     "Keybindings", "Startup Apps", "Default Apps", "Window Rules", "Input",
-    "Displays", "Session", "About",
+    "Displays", "Session", "Profile", "About",
 };
 
 static const char *PAGE_SUBS[PAGE_COUNT] = {
@@ -421,6 +438,7 @@ static const char *PAGE_SUBS[PAGE_COUNT] = {
     "Pointer, touchpad and keyboard behaviour",
     "Outputs, resolution, refresh rate and scale",
     "Idle, lock and power commands",
+    "Weather location, units and your JTLab avatar",
     "Version and build information",
 };
 
@@ -450,6 +468,7 @@ enum {
     SL_DELAY,
     SL_START_DELAY,
     SL_IDLE,
+    SL_PHOTO_ZOOM,
     SL_COUNT
 };
 
@@ -463,6 +482,7 @@ enum {
     SEG_REFRESH_B,
     SEG_SCALE_B,
     SEG_ORIENT_B,
+    SEG_WX_UNITS,
     SEG_COUNT
 };
 
@@ -485,7 +505,11 @@ enum {
     HIT_DISP_MODE,
     HIT_APP_FIELD,
     HIT_APP_PICK,
-    HIT_APP_PICKER_CLOSE
+    HIT_APP_PICKER_CLOSE,
+    HIT_WX_FIELD,
+    HIT_WX_QUERY_FIELD,
+    HIT_WX_RESULT,
+    HIT_ZOOM_SCRIM
 };
 
 enum {
@@ -501,6 +525,11 @@ enum {
     BTN_DISPLAYS_APPLY,
     BTN_DISPLAYS_RESET,
     BTN_MODE_CLOSE,
+    BTN_WX_SEARCH,
+    BTN_PHOTO_PICK,
+    BTN_PHOTO_CLEAR,
+    BTN_ZOOM_CANCEL,
+    BTN_ZOOM_SAVE,
 
     /* Dynamic IDs must come after every fixed button ID; otherwise a
      * startup Remove button can swallow an unrelated button press. */
@@ -560,6 +589,34 @@ static DesktopApp g_desktop_apps[MAX_DESKTOP_APPS];
 static int g_desktop_app_count;
 static char g_default_apps[APP_CAT_COUNT][APP_ID_MAX];
 
+/* Profile page state.  g_profile_cfg mirrors ~/.config/jt/profile.config;
+ * the search results and pending photo are local to this session. */
+typedef struct {
+    char name[WX_RESULT_NAME_MAX];
+    double lat, lon;
+} WxResult;
+
+typedef struct {
+    char location[WX_LOC_MAX];
+    char photo[PROFILE_PATH_MAX];
+    double zoom;
+    int fahrenheit;
+    int have_coords;
+    double lat, lon;
+} ProfileCfg;
+
+static ProfileCfg g_profile_cfg;
+static WxResult g_wx_results[WX_RESULTS];
+static int g_wx_result_count;
+static int g_wx_searching;
+static char g_pending_photo[PROFILE_PATH_MAX];
+static double g_pending_zoom;
+static int g_zoom_open;
+static cairo_surface_t *g_photo_preview;
+/* Async portal/search callbacks run inside our GLib main context on the same
+ * thread; they set this so the Wayland loop repaints. */
+static int g_profile_dirty;
+
 typedef struct {
     int page;
     double t;
@@ -596,6 +653,10 @@ typedef struct {
     double pos_scale;
     double pos_offx;
     double pos_offy;
+    int wx_editing;
+    char wx_location_input[WX_LOC_MAX];
+    int wx_query_editing;
+    char wx_query_input[WX_QUERY_MAX];
 } Ui;
 
 static Ui g_ui;
@@ -677,6 +738,16 @@ static void defaultapps_load(void);
 static void defaultapps_save(void);
 static void defaultapps_choose(int cat, int candidate);
 
+/* Profile page / shared configuration. */
+static void profile_config_load(void);
+static void profile_save(void);
+static int profile_preview_load(const char *path);
+static void jtlab_reload(void);
+static void profile_open_picker(void);
+static void wx_search_start(void);
+static void glib_services_init(void);
+static void glib_services_cleanup(void);
+
 static void ui_toast(const char *msg)
 {
     snprintf(g_ui.toast, sizeof g_ui.toast, "%s", msg);
@@ -755,6 +826,24 @@ static void ui_init(void)
 
     /* Installed application desktop files and XDG defaults. */
     defaultapps_load();
+
+    /* Profile page: fallbacks first, then the shared config file. */
+    memset(&g_profile_cfg, 0, sizeof g_profile_cfg);
+    snprintf(g_profile_cfg.location, sizeof g_profile_cfg.location,
+             "Kimberley");
+    g_profile_cfg.zoom = 1.0;
+    g_wx_result_count = 0;
+    g_wx_searching = 0;
+    g_zoom_open = 0;
+    g_photo_preview = NULL;
+    profile_config_load();
+
+    g_ui.sliders[SL_PHOTO_ZOOM] =
+        (g_profile_cfg.zoom - PROFILE_ZOOM_MIN) /
+        (PROFILE_ZOOM_MAX - PROFILE_ZOOM_MIN);
+    g_ui.segments[SEG_WX_UNITS] = g_profile_cfg.fahrenheit ? 1 : 0;
+    if (g_profile_cfg.photo[0])
+        profile_preview_load(g_profile_cfg.photo);
 }
 
 /* ---- display helpers --------------------------------------------- */
@@ -1532,6 +1621,15 @@ static void paint_nav_icon(cairo_t *cr, int page, double x, double y,
         cairo_line_to(cr, cx, cy);
         cairo_stroke(cr);
         break;
+    case PAGE_PROFILE:
+        /* a head above a shallow shoulder arc */
+        cairo_new_path(cr);
+        cairo_arc(cr, cx, cy - 3.6, 3.0, 0.0, 2.0 * PI);
+        cairo_stroke(cr);
+        cairo_new_path(cr);
+        cairo_arc(cr, cx, cy + 8.2, 6.0, PI, 2.0 * PI);
+        cairo_stroke(cr);
+        break;
     default:
         /* info: dot above a short stem */
         cairo_arc(cr, cx, cy, 7.4, 0.0, 2.0 * PI);
@@ -1975,6 +2073,8 @@ static void paint_footer(cairo_t *cr)
         ? "BUILT-IN SHORTCUTS · jtlabwc"
         : g_ui.page == PAGE_INPUT
         ? "INPUT · ~/.config/jt/input.conf"
+        : g_ui.page == PAGE_PROFILE
+        ? "PROFILE · ~/.config/jt/profile.config"
         : "PREVIEW · changes are not saved";
     unsigned col = C_FAINT;
     double alpha = 0.9;
@@ -2552,6 +2652,545 @@ input_commit(void)
     input_save();
     jtlabwc_reload();
     ui_toast("Input settings applied");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Profile page: shared config, XDG portal and location search          */
+/* ------------------------------------------------------------------ */
+
+static GMainContext *g_glctx;
+static GDBusConnection *g_bus;
+static GPid g_own_bus_pid = -1;
+static SoupSession *g_wx_session;
+static guint g_portal_signal;
+static char g_portal_path[256];
+
+/* Ask the bar to re-read profile.config so changes are live. */
+static void
+jtlab_reload(void)
+{
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    char path[256];
+    snprintf(path, sizeof path, "%s/jtlab-ctl.sock",
+             (rt && *rt) ? rt : "/tmp");
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    if (strlen(path) >= sizeof addr.sun_path)
+        return;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
+        static const char msg[] = "reload\n";
+        (void)!write(fd, msg, sizeof msg - 1);
+    }
+    close(fd);
+}
+
+static void
+profile_config_path(char *buf, size_t n)
+{
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(buf, n, "%s/.config/jt/%s", home, PROFILE_CONFIG_FILE);
+}
+
+static void
+profile_config_load(void)
+{
+    char path[512];
+    profile_config_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *s = startup_trim(line);
+        if (!*s || *s == '#') continue;
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = startup_trim(s);
+        char *val = startup_trim(eq + 1);
+
+        if (!strcmp(key, "weather_location")) {
+            if (*val)
+                snprintf(g_profile_cfg.location, sizeof g_profile_cfg.location,
+                         "%s", val);
+        } else if (!strcmp(key, "weather_units")) {
+            g_profile_cfg.fahrenheit =
+                !strcmp(val, "fahrenheit") || !strcmp(val, "f") ||
+                !strcmp(val, "degrees") || !strcmp(val, "°f");
+        } else if (!strcmp(key, "weather_latitude")) {
+            g_profile_cfg.lat = strtod(val, NULL);
+            g_profile_cfg.have_coords = 1;
+        } else if (!strcmp(key, "weather_longitude")) {
+            g_profile_cfg.lon = strtod(val, NULL);
+            g_profile_cfg.have_coords = 1;
+        } else if (!strcmp(key, "profile_photo")) {
+            snprintf(g_profile_cfg.photo, sizeof g_profile_cfg.photo,
+                     "%s", val);
+        } else if (!strcmp(key, "profile_zoom")) {
+            double z = strtod(val, NULL);
+            if (z >= PROFILE_ZOOM_MIN && z <= PROFILE_ZOOM_MAX)
+                g_profile_cfg.zoom = z;
+        }
+    }
+    fclose(f);
+
+    if (g_profile_cfg.have_coords &&
+        (g_profile_cfg.lat < -90.0 || g_profile_cfg.lat > 90.0 ||
+         g_profile_cfg.lon < -180.0 || g_profile_cfg.lon > 180.0))
+        g_profile_cfg.have_coords = 0;
+}
+
+static void
+profile_save(void)
+{
+    char path[512];
+    profile_config_path(path, sizeof path);
+    startup_mkdirs(path);
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        ui_toast("Could not write profile.config");
+        return;
+    }
+    fprintf(f, "# jtsettings profile configuration\n");
+    fprintf(f, "# Read by JTLab; reload is sent over its control socket.\n");
+    fprintf(f, "weather_location=%s\n", g_profile_cfg.location);
+    fprintf(f, "weather_units=%s\n",
+            g_profile_cfg.fahrenheit ? "fahrenheit" : "celsius");
+    if (g_profile_cfg.have_coords) {
+        fprintf(f, "weather_latitude=%.6f\n", g_profile_cfg.lat);
+        fprintf(f, "weather_longitude=%.6f\n", g_profile_cfg.lon);
+    }
+    fprintf(f, "profile_photo=%s\n", g_profile_cfg.photo);
+    fprintf(f, "profile_zoom=%.3f\n", g_profile_cfg.zoom);
+    fclose(f);
+    jtlab_reload();
+}
+
+/* GdkPixbuf -> premultiplied ARGB32 for the zoom preview. */
+static cairo_surface_t *
+pixbuf_surface(GdkPixbuf *pix)
+{
+    int w = gdk_pixbuf_get_width(pix);
+    int h = gdk_pixbuf_get_height(pix);
+    int nch = gdk_pixbuf_get_n_channels(pix);
+    int rs = gdk_pixbuf_get_rowstride(pix);
+    const guchar *src = gdk_pixbuf_get_pixels(pix);
+
+    cairo_surface_t *sf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    if (cairo_surface_status(sf) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(sf);
+        return NULL;
+    }
+    cairo_surface_flush(sf);
+    unsigned char *dst = cairo_image_surface_get_data(sf);
+    int stride = cairo_image_surface_get_stride(sf);
+
+    for (int y = 0; y < h; y++) {
+        guint32 *row = (guint32 *)(void *)(dst + y * stride);
+        for (int x = 0; x < w; x++) {
+            const guchar *p = src + y * rs + x * nch;
+            guint32 r = p[0], g = p[1], b = p[2];
+            guint32 a = (nch >= 4) ? p[3] : 255U;
+            if (a == 0U)
+                row[x] = 0U;
+            else if (a == 255U)
+                row[x] = 0xFF000000U | (r << 16) | (g << 8) | b;
+            else
+                row[x] = (a << 24) |
+                         ((r * a / 255U) << 16) |
+                         ((g * a / 255U) << 8) |
+                         (b * a / 255U);
+        }
+    }
+    cairo_surface_mark_dirty(sf);
+    return sf;
+}
+
+static int
+profile_preview_load(const char *path)
+{
+    if (g_photo_preview) {
+        cairo_surface_destroy(g_photo_preview);
+        g_photo_preview = NULL;
+    }
+    GError *err = NULL;
+    GdkPixbuf *pix = gdk_pixbuf_new_from_file_at_scale(path, 320, 320,
+                                                       TRUE, &err);
+    if (err) g_error_free(err);
+    if (!pix) return 0;
+    g_photo_preview = pixbuf_surface(pix);
+    g_object_unref(pix);
+    return g_photo_preview != NULL;
+}
+
+/* ---- location search (Open-Meteo geocoding, same API the bar uses) ---- */
+
+static const char *
+json_key(const char *js, const char *key)
+{
+    size_t klen = strlen(key);
+    for (const char *p = js; (p = strchr(p, '"')) != NULL; p++) {
+        if (strncmp(p + 1, key, klen) != 0 || p[1 + klen] != '"') continue;
+        const char *q = p + 2 + klen;
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        if (*q == ':') return q + 1;
+    }
+    return NULL;
+}
+
+static int
+json_num(const char *p, double *out)
+{
+    if (!p) return 0;
+    char *end;
+    double v = strtod(p, &end);
+    if (end == p) return 0;
+    *out = v;
+    return 1;
+}
+
+static int
+json_str(const char *p, char *out, size_t n)
+{
+    if (!p || *p != '"' || n == 0) return 0;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) p++;
+        if (i + 1 < n) out[i++] = *p;
+        p++;
+    }
+    if (*p != '"') return 0;
+    out[i] = '\0';
+    return 1;
+}
+
+static const char *
+json_arr_at(const char *p, int i)
+{
+    if (!p) return NULL;
+    while (*p && *p != '[') p++;
+    if (*p != '[') return NULL;
+    p++;
+    while (i-- > 0) {
+        int depth = 0;
+        while (*p) {
+            if (*p == '"') {
+                p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\' && p[1]) p++;
+                    p++;
+                }
+                if (!*p) return NULL;
+            } else if (*p == '[' || *p == '{') {
+                depth++;
+            } else if (*p == ']' || *p == '}') {
+                if (depth == 0) return NULL;
+                depth--;
+            } else if (*p == ',' && depth == 0) {
+                break;
+            }
+            p++;
+        }
+        if (*p != ',') return NULL;
+        p++;
+    }
+    return p;
+}
+
+static void
+wx_url_encode(const char *in, char *out, size_t n)
+{
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+        if (o + 4 >= n) break;
+        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~')
+            out[o++] = (char)*p;
+        else
+            o += (size_t)snprintf(out + o, n - o, "%%%02X", *p);
+    }
+    out[o] = '\0';
+}
+
+static void
+wx_search_finish(GObject *src, GAsyncResult *res, gpointer data)
+{
+    (void)data;
+    GError *err = NULL;
+    GBytes *body = soup_session_send_and_read_finish(SOUP_SESSION(src), res,
+                                                     &err);
+    g_wx_searching = 0;
+    g_wx_result_count = 0;
+    if (body) {
+        gsize len = 0;
+        const char *js = g_bytes_get_data(body, &len);
+        if (js) {
+            char *copy = g_strndup(js, len);
+            const char *arr = json_key(copy, "results");
+            for (int i = 0; i < WX_RESULTS && arr; i++) {
+                const char *hit = json_arr_at(arr, i);
+                if (!hit) break;
+                char name[64], country[64], admin[64];
+                name[0] = country[0] = admin[0] = '\0';
+                json_str(json_key(hit, "name"), name, sizeof name);
+                json_str(json_key(hit, "country"), country, sizeof country);
+                json_str(json_key(hit, "admin1"), admin, sizeof admin);
+                WxResult *r = &g_wx_results[g_wx_result_count];
+                if (name[0])
+                    snprintf(r->name, sizeof r->name, "%s, %s",
+                             name, country[0] ? country : admin);
+                if (!json_num(json_key(hit, "latitude"), &r->lat) ||
+                    !json_num(json_key(hit, "longitude"), &r->lon))
+                    continue;
+                g_wx_result_count++;
+            }
+            g_free(copy);
+        }
+        g_bytes_unref(body);
+    }
+    if (err) g_error_free(err);
+    if (g_wx_result_count == 0)
+        ui_toast("No matching places found");
+    g_profile_dirty = 1;
+}
+
+static void
+wx_search_start(void)
+{
+    if (!g_wx_session) {
+        ui_toast("Weather search unavailable");
+        return;
+    }
+    if (!g_ui.wx_query_input[0]) {
+        ui_toast("Type a place name first");
+        return;
+    }
+    char enc[WX_QUERY_MAX * 4];
+    wx_url_encode(g_ui.wx_query_input, enc, sizeof enc);
+    char url[768];
+    snprintf(url, sizeof url,
+             "https://geocoding-api.open-meteo.com/v1/search?name=%s"
+             "&count=%d&language=en&format=json",
+             enc, WX_RESULTS);
+    g_wx_searching = 1;
+    g_wx_result_count = 0;
+    g_profile_dirty = 1;
+    SoupMessage *msg = soup_message_new("GET", url);
+    if (!msg) {
+        g_wx_searching = 0;
+        ui_toast("Could not build the search request");
+        return;
+    }
+    soup_session_send_and_read_async(g_wx_session, msg, G_PRIORITY_DEFAULT,
+                                     NULL, wx_search_finish, NULL);
+}
+
+/* ---- XDG file chooser portal ---- */
+
+static void
+portal_unsubscribe(void)
+{
+    if (g_bus && g_portal_signal) {
+        g_dbus_connection_signal_unsubscribe(g_bus, g_portal_signal);
+        g_portal_signal = 0;
+    }
+}
+
+static void
+portal_response(GDBusConnection *conn, const char *sender, const char *path,
+                const char *iface, const char *signal, GVariant *params,
+                gpointer data)
+{
+    (void)conn; (void)sender; (void)path; (void)iface; (void)signal; (void)data;
+
+    guint32 response = 0;
+    GVariant *results = NULL;
+    g_variant_get(params, "(u@a{sv})", &response, &results);
+
+    if (response == 0) {
+        GVariant *uris = g_variant_lookup_value(results, "uris",
+                                                G_VARIANT_TYPE_STRING_ARRAY);
+        if (uris && g_variant_n_children(uris) > 0) {
+            const char *uri = NULL;
+            g_variant_get_child(uris, 0, "&s", &uri);
+            if (uri) {
+                char *local = g_filename_from_uri(uri, NULL, NULL);
+                if (local) {
+                    snprintf(g_pending_photo, sizeof g_pending_photo,
+                             "%s", local);
+                    g_pending_zoom = !strcmp(local, g_profile_cfg.photo)
+                                     ? g_profile_cfg.zoom : 1.0;
+                    if (profile_preview_load(g_pending_photo)) {
+                        g_ui.sliders[SL_PHOTO_ZOOM] =
+                            (g_pending_zoom - PROFILE_ZOOM_MIN) /
+                            (PROFILE_ZOOM_MAX - PROFILE_ZOOM_MIN);
+                        g_zoom_open = 1;
+                        ui_toast("Adjust the zoom, then Use photo");
+                    } else {
+                        ui_toast("Could not read that image");
+                    }
+                    g_free(local);
+                }
+            }
+        }
+        if (uris) g_variant_unref(uris);
+    }
+    if (results) g_variant_unref(results);
+    portal_unsubscribe();
+    g_profile_dirty = 1;
+}
+
+static void
+portal_open_cb(GObject *src, GAsyncResult *res, gpointer data)
+{
+    (void)data;
+    GError *err = NULL;
+    GVariant *ret = g_dbus_connection_call_finish(G_DBUS_CONNECTION(src),
+                                                  res, &err);
+    if (!ret) {
+        ui_toast("Could not open the file chooser portal");
+        if (err) g_error_free(err);
+        g_profile_dirty = 1;
+        return;
+    }
+
+    const char *handle = NULL;
+    g_variant_get(ret, "(&o)", &handle);
+    portal_unsubscribe();
+    if (handle) {
+        snprintf(g_portal_path, sizeof g_portal_path, "%s", handle);
+        g_portal_signal = g_dbus_connection_signal_subscribe(
+            g_bus, "org.freedesktop.portal.Desktop",
+            "org.freedesktop.portal.Request", "Response",
+            g_portal_path, NULL, G_DBUS_SIGNAL_FLAGS_NO_MATCH_RULE,
+            portal_response, NULL, NULL);
+    }
+    g_variant_unref(ret);
+}
+
+static void
+profile_open_picker(void)
+{
+    if (!g_bus) {
+        ui_toast("File picker unavailable — no D-Bus session bus");
+        return;
+    }
+    GVariantBuilder opts;
+    g_variant_builder_init(&opts, G_VARIANT_TYPE_VARDICT);
+    g_variant_builder_add(&opts, "{sv}", "modal", g_variant_new_boolean(TRUE));
+    g_dbus_connection_call(
+        g_bus,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.FileChooser",
+        "OpenFile",
+        g_variant_new("(ss@a{sv})", "", "Choose profile picture",
+                      g_variant_builder_end(&opts)),
+        G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 10000,
+        NULL, portal_open_cb, NULL);
+    ui_toast("Waiting for the file chooser…");
+    g_profile_dirty = 1;
+}
+
+/* A bare jtlabwc session need not export DBUS_SESSION_BUS_ADDRESS, and GLib's
+ * autolaunch path needs an X11 $DISPLAY. When there is no bus to talk to, start
+ * a private one so the XDG file chooser still works. The portal itself is
+ * then activated over D-Bus like any other service. */
+static int
+start_own_session_bus(void)
+{
+    GError *err = NULL;
+    gchar *out = NULL, *errout = NULL;
+    gint status = 0;
+
+    if (!g_spawn_command_line_sync(
+            "dbus-daemon --session --fork --print-address=1 --print-pid=1",
+            &out, &errout, &status, &err) ||
+        status != 0 || !out || !*out) {
+        fprintf(stderr, "jtsettings: could not start session bus: %s\n",
+                err ? err->message : (errout && *errout ? errout : "unknown"));
+        if (err) g_error_free(err);
+        g_free(out);
+        g_free(errout);
+        return 0;
+    }
+
+    int got_address = 0;
+    gchar **lines = g_strsplit(out, "\n", -1);
+    if (lines[0] && *lines[0]) {
+        g_setenv("DBUS_SESSION_BUS_ADDRESS", lines[0], TRUE);
+        got_address = 1;
+        for (int i = 1; lines[i]; i++) {
+            gint64 pid = g_ascii_strtoll(lines[i], NULL, 10);
+            if (pid > 0) {
+                g_own_bus_pid = (GPid)pid;
+                break;
+            }
+        }
+    }
+    g_strfreev(lines);
+    g_free(out);
+    g_free(errout);
+    return got_address;
+}
+
+static void
+glib_services_init(void)
+{
+    g_glctx = g_main_context_new();
+    g_main_context_push_thread_default(g_glctx);
+
+    GError *err = NULL;
+    g_bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
+    if (!g_bus) {
+        if (err) {
+            g_error_free(err);
+            err = NULL;
+        }
+        if (start_own_session_bus())
+            g_bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
+        if (!g_bus) {
+            fprintf(stderr, "jtsettings: XDG file portal unavailable: %s\n",
+                    err ? err->message : "no session bus");
+            if (err) g_error_free(err);
+        }
+    }
+    g_wx_session = soup_session_new_with_options("timeout", 10, NULL);
+}
+
+static void
+glib_services_cleanup(void)
+{
+    portal_unsubscribe();
+    if (g_wx_session) {
+        g_object_unref(g_wx_session);
+        g_wx_session = NULL;
+    }
+    if (g_bus) {
+        g_object_unref(g_bus);
+        g_bus = NULL;
+    }
+    if (g_photo_preview) {
+        cairo_surface_destroy(g_photo_preview);
+        g_photo_preview = NULL;
+    }
+    if (g_glctx) {
+        g_main_context_pop_thread_default(g_glctx);
+        g_main_context_unref(g_glctx);
+        g_glctx = NULL;
+    }
+    if (g_own_bus_pid > 0) {
+        kill((pid_t)g_own_bus_pid, SIGTERM);
+        g_own_bus_pid = -1;
+        g_unsetenv("DBUS_SESSION_BUS_ADDRESS");
+    }
 }
 
 #define DISPLAYS_FILE "displays.conf"
@@ -4026,6 +4665,302 @@ static void page_session(cairo_t *cr)
         8.8, 400, C_FAINT, 0.8, CONTENT_X, WIN_H - 128.0, CONTENT_W, 2);
 }
 
+static double
+photo_zoom_value(void)
+{
+    double t = clampd(g_ui.sliders[SL_PHOTO_ZOOM], 0.0, 1.0);
+    return PROFILE_ZOOM_MIN + t * (PROFILE_ZOOM_MAX - PROFILE_ZOOM_MIN);
+}
+
+/* Centre-cropped circular preview, using the same geometry JTLab uses for
+ * the bar avatar so what you see here is what the bar will draw. */
+static void
+paint_photo_circle(cairo_t *cr, cairo_surface_t *sf,
+                   double cx, double cy, double r, double zoom)
+{
+    rgba(cr, C_TRACK, 0.9);
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy, r, 0.0, 2.0 * PI);
+    cairo_fill(cr);
+
+    if (sf) {
+        int iw = cairo_image_surface_get_width(sf);
+        int ih = cairo_image_surface_get_height(sf);
+        if (iw > 0 && ih > 0) {
+            double mn = iw < ih ? iw : ih;
+            if (zoom < PROFILE_ZOOM_MIN) zoom = PROFILE_ZOOM_MIN;
+            if (zoom > PROFILE_ZOOM_MAX) zoom = PROFILE_ZOOM_MAX;
+            double centre = mn / (2.0 * zoom);
+            cairo_save(cr);
+            cairo_arc(cr, cx, cy, r, 0.0, 2.0 * PI);
+            cairo_clip(cr);
+            cairo_translate(cr, cx - r, cy - r);
+            cairo_scale(cr, 2.0 * r * zoom / mn, 2.0 * r * zoom / mn);
+            cairo_set_source_surface(cr, sf,
+                                     centre - iw / 2.0,
+                                     centre - ih / 2.0);
+            cairo_paint(cr);
+            cairo_restore(cr);
+        }
+    } else {
+        rgba(cr, C_FAINT, 0.55);
+        cairo_new_path(cr);
+        cairo_arc(cr, cx, cy - r * 0.22, r * 0.28, 0.0, 2.0 * PI);
+        cairo_fill(cr);
+        cairo_new_path(cr);
+        cairo_arc(cr, cx, cy + r * 0.85, r * 0.62, PI, 2.0 * PI);
+        cairo_fill(cr);
+    }
+
+    rgba(cr, C_BORDER, 0.85);
+    cairo_set_line_width(cr, 1.0);
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy, r - 0.5, 0.0, 2.0 * PI);
+    cairo_stroke(cr);
+}
+
+static void
+paint_field_box(cairo_t *cr, double x, double y, double w, double h,
+                const char *text, int editing, int hot)
+{
+    rgba(cr, C_TRACK, 0.9);
+    rounded_rect(cr, x, y, w, h, 7.0);
+    cairo_fill(cr);
+    rgba(cr, hot ? C_ACCENT : C_BORDER, hot ? 0.75 : 0.5);
+    cairo_set_line_width(cr, 1.0);
+    rounded_rect(cr, x + 0.5, y + 0.5, w - 1.0, h - 1.0, 6.5);
+    cairo_stroke(cr);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, x + 1.0, y + 1.0, w - 2.0, h - 2.0);
+    cairo_clip(cr);
+    text_draw(cr, text, 10.5, 500, editing ? C_FG : 0xD6D6D6, 0.94,
+              x + 12.0, y + (h - 13.0) / 2.0, ALIGN_LEFT, 0.1);
+    if (editing && (int)(g_ui.t * 2.0) % 2 == 0) {
+        double cx = x + 12.0 +
+                    text_width(cr, text, 10.5, 500, 0.1) + 2.0;
+        rgba(cr, C_ACCENT, 0.9);
+        cairo_set_line_width(cr, 1.2);
+        cairo_move_to(cr, cx, y + 7.0);
+        cairo_line_to(cr, cx, y + h - 7.0);
+        cairo_stroke(cr);
+    }
+    cairo_restore(cr);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Page: Profile                                                      */
+/* ------------------------------------------------------------------ */
+
+static void
+page_profile(cairo_t *cr)
+{
+    section_label(cr, "WEATHER", CONTENT_X, 102.0);
+    text_draw(cr, "Location and temperature unit shown in JTLab's status bar",
+              9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
+
+    double cy = 132.0, ch = 250.0;
+    paint_card(cr, CONTENT_X, cy, CONTENT_W, ch);
+
+    double inner = CONTENT_W - 36.0;
+    double lx = CONTENT_X + 18.0;
+    double lw = inner * 0.60;
+    double rx = lx + lw + 20.0;
+    double rw = inner - lw - 20.0;
+
+    text_draw(cr, "LOCATION", 8.0, 600, C_FAINT, 0.9,
+              lx, cy + 14.0, ALIGN_LEFT, 1.4);
+    int loc_hit = add_hit(HIT_WX_FIELD, 0, 0, lx, cy + 27.0, lw, 34.0);
+    paint_field_box(cr, lx, cy + 27.0, lw, 34.0,
+                    g_ui.wx_editing ? g_ui.wx_location_input
+                                    : g_profile_cfg.location,
+                    g_ui.wx_editing, hit_hover(loc_hit));
+
+    text_draw(cr, "FIND A PLACE", 8.0, 600, C_FAINT, 0.9,
+              lx, cy + 74.0, ALIGN_LEFT, 1.4);
+    double qw = lw - 104.0;
+    int q_hit = add_hit(HIT_WX_QUERY_FIELD, 0, 0, lx, cy + 87.0, qw, 32.0);
+    paint_field_box(cr, lx, cy + 87.0, qw, 32.0,
+                    g_ui.wx_query_input[0] ? g_ui.wx_query_input : "e.g. Cape Town",
+                    g_ui.wx_query_editing, hit_hover(q_hit));
+    paint_button(cr, lx + lw - 96.0, cy + 87.0, 96.0, 32.0,
+                 g_wx_searching ? "Searching…" : "Search", 1,
+                 BTN_WX_SEARCH);
+
+    double row_y = cy + 126.0;
+    if (g_wx_result_count > 0) {
+        for (int i = 0; i < g_wx_result_count; i++) {
+            double ry = row_y + i * 19.0;
+            int idx = add_hit(HIT_WX_RESULT, i, 0, lx - 4.0, ry - 2.0,
+                              lw + 8.0, 19.0);
+            int hot = hit_hover(idx);
+            if (hot) {
+                rgba(cr, C_FG, 0.05);
+                rounded_rect(cr, lx - 4.0, ry - 2.0, lw + 8.0, 19.0, 5.0);
+                cairo_fill(cr);
+            }
+            rgba(cr, hot ? C_ACCENT : C_FAINT, 0.85);
+            cairo_arc(cr, lx + 5.0, ry + 8.0, 2.0, 0.0, 2.0 * PI);
+            cairo_fill(cr);
+            text_draw(cr, g_wx_results[i].name, 9.5, 500,
+                      hot ? C_FG : 0xD0D0D0, 0.92,
+                      lx + 14.0, ry + 2.0, ALIGN_LEFT, 0.1);
+        }
+    } else if (!g_wx_searching) {
+        text_wrap(cr,
+                  "Type a city and press Search, or click the location field "
+                  "and type a place name directly. Press Enter to save.",
+                  9.0, 400, C_FAINT, 0.8, lx, row_y + 2.0, lw, 3);
+    } else {
+        text_draw(cr, "Looking up places…", 9.5, 400, C_DIM, 0.8,
+                  lx, row_y + 3.0, ALIGN_LEFT, 0.1);
+    }
+
+    text_draw(cr, "TEMPERATURE UNIT", 8.0, 600, C_FAINT, 0.9,
+              rx, cy + 14.0, ALIGN_LEFT, 1.4);
+    static const char *const units[] = { "Celsius", "Fahrenheit" };
+    paint_segment(cr, rx, cy + 28.0, rw, 30.0, units, 2,
+                  g_ui.segments[SEG_WX_UNITS], SEG_WX_UNITS);
+    text_wrap(cr,
+              "Open-Meteo readings are converted when drawn, so switching "
+              "units never needs a new fetch.",
+              9.0, 400, C_DIM, 0.75, rx, cy + 78.0, rw, 3);
+    paint_divider(cr, rx, cy + 146.0, rw);
+    text_draw(cr, "DEVICE STATE", 8.0, 600, C_FAINT, 0.9,
+              rx, cy + 160.0, ALIGN_LEFT, 1.4);
+    char coords[96];
+    if (g_profile_cfg.have_coords)
+        snprintf(coords, sizeof coords, "%.3f, %.3f",
+                 g_profile_cfg.lat, g_profile_cfg.lon);
+    else
+        snprintf(coords, sizeof coords, "Resolved by place name");
+    text_draw(cr, coords, 10.0, 500, C_ACCENT, 0.92,
+              rx, cy + 180.0, ALIGN_LEFT, 0.15);
+    text_draw(cr, "~/.config/jt/profile.config", 8.5, 400, C_DIM, 0.75,
+              rx, cy + 207.0, ALIGN_LEFT, 0.1);
+
+    section_label(cr, "PROFILE PHOTO", CONTENT_X, 402.0);
+    text_draw(cr, "The avatar drawn above the power menu in JTLab",
+              9.5, 400, C_DIM, 0.75, CONTENT_X, 417.0, ALIGN_LEFT, 0.1);
+
+    double py = 432.0, ph = 200.0;
+    paint_card(cr, CONTENT_X, py, CONTENT_W, ph);
+    double ax = CONTENT_X + 76.0;
+    double ay = py + 92.0;
+    paint_photo_circle(cr, g_photo_preview, ax, ay, 48.0, photo_zoom_value());
+
+    double px = CONTENT_X + 152.0;
+    double pw = CONTENT_W - 170.0;
+    text_draw(cr, "JTLab avatar", 12.0, 600, 0xE8E8E8, 0.95,
+              px, py + 16.0, ALIGN_LEFT, 0.1);
+    text_draw(cr, "Choose an image with the file portal, then set its zoom.",
+              9.0, 400, C_DIM, 0.78, px, py + 34.0, ALIGN_LEFT, 0.1);
+
+    paint_button(cr, px, py + 54.0, 140.0, 32.0,
+                 "Choose picture", 1, BTN_PHOTO_PICK);
+    paint_button(cr, px + 150.0, py + 54.0, 96.0, 32.0,
+                 "Remove", 0, BTN_PHOTO_CLEAR);
+
+    char ztxt[32];
+    snprintf(ztxt, sizeof ztxt, "%.2fx", photo_zoom_value());
+    paint_slider_row(cr, px, py + 108.0, pw, "Zoom", ztxt,
+                     g_ui.sliders[SL_PHOTO_ZOOM], SL_PHOTO_ZOOM);
+
+    char shown[PROFILE_PATH_MAX + 16];
+    if (g_profile_cfg.photo[0])
+        snprintf(shown, sizeof shown, "Image: %s", g_profile_cfg.photo);
+    else
+        snprintf(shown, sizeof shown, "Image: using the built-in avatar");
+    text_wrap(cr, shown, 8.5, 400, C_FAINT, 0.8,
+              px, py + 168.0, pw, 1);
+
+    text_wrap(cr,
+              "The location, unit, picture and zoom are written to "
+              "~/.config/jt/profile.config and applied to JTLab immediately.",
+              8.8, 400, C_FAINT, 0.8, CONTENT_X, 650.0, CONTENT_W, 2);
+}
+
+/* A small confirmation step that appears right after the portal returns an
+ * image: preview the centre crop and drag the slider before saving. */
+static void
+zoom_overlay_rect(double *x, double *y, double *w, double *h)
+{
+    *w = 440.0;
+    *h = 372.0;
+    *x = (WIN_W - *w) / 2.0;
+    *y = (WIN_H - *h) / 2.0;
+}
+
+static void
+paint_zoom_overlay(cairo_t *cr)
+{
+    rgba(cr, 0x000000, 0.74);
+    cairo_rectangle(cr, 0, 0, WIN_W, WIN_H);
+    cairo_fill(cr);
+    add_hit(HIT_ZOOM_SCRIM, 0, 0, 0, 0, WIN_W, WIN_H);
+
+    double x, y, w, h;
+    zoom_overlay_rect(&x, &y, &w, &h);
+    paint_card(cr, x, y, w, h);
+    /* Swallow clicks on the dialog itself so only the dimmed area cancels. */
+    add_hit(HIT_NONE, 0, 0, x, y, w, h);
+
+    text_draw(cr, "Adjust profile photo", 16.0, 700, C_FG, 0.98,
+              x + w / 2.0, y + 20.0, ALIGN_CENTER, 0.1);
+    text_draw(cr, "Drag the slider to frame your picture",
+              9.0, 400, C_DIM, 0.8, x + w / 2.0, y + 42.0,
+              ALIGN_CENTER, 0.1);
+
+    paint_photo_circle(cr, g_photo_preview, x + w / 2.0, y + 136.0,
+                       68.0, photo_zoom_value());
+
+    char ztxt[32];
+    snprintf(ztxt, sizeof ztxt, "%.2fx", photo_zoom_value());
+    paint_slider_row(cr, x + 34.0, y + 242.0, w - 68.0, "Zoom", ztxt,
+                     g_ui.sliders[SL_PHOTO_ZOOM], SL_PHOTO_ZOOM);
+
+    paint_button(cr, x + 34.0, y + 310.0, 120.0, 36.0,
+                 "Cancel", 0, BTN_ZOOM_CANCEL);
+    paint_button(cr, x + w - 154.0, y + 310.0, 120.0, 36.0,
+                 "Use photo", 1, BTN_ZOOM_SAVE);
+
+    text_draw(cr, "1.0x shows the whole image · zoom in to crop",
+              8.5, 400, C_FAINT, 0.8, x + w / 2.0, y + 352.0,
+              ALIGN_CENTER, 0.1);
+}
+
+/* Leaving the preview without saving restores the page's saved zoom so the
+ * avatar preview below keeps matching what JTLab is drawing. */
+static void
+zoom_cancel(void)
+{
+    g_zoom_open = 0;
+    g_pending_photo[0] = '\0';
+    if (g_photo_preview) {
+        cairo_surface_destroy(g_photo_preview);
+        g_photo_preview = NULL;
+        if (g_profile_cfg.photo[0])
+            profile_preview_load(g_profile_cfg.photo);
+    }
+    g_ui.sliders[SL_PHOTO_ZOOM] =
+        (g_profile_cfg.zoom - PROFILE_ZOOM_MIN) /
+        (PROFILE_ZOOM_MAX - PROFILE_ZOOM_MIN);
+}
+
+static void
+zoom_accept(void)
+{
+    if (!g_pending_photo[0])
+        return;
+    snprintf(g_profile_cfg.photo, sizeof g_profile_cfg.photo,
+             "%s", g_pending_photo);
+    g_profile_cfg.zoom = photo_zoom_value();
+    g_pending_photo[0] = '\0';
+    g_zoom_open = 0;
+    profile_save();
+    ui_toast("Profile photo saved");
+}
+
 /* ------------------------------------------------------------------ */
 /*  Page: About                                                        */
 /* ------------------------------------------------------------------ */
@@ -4141,6 +5076,7 @@ static void paint_content(cairo_t *cr)
     case PAGE_INPUT: page_input(cr); break;
     case PAGE_DISPLAYS: page_displays(cr); break;
     case PAGE_SESSION: page_session(cr); break;
+    case PAGE_PROFILE: page_profile(cr); break;
     case PAGE_ABOUT: page_about(cr); break;
     default: break;
     }
@@ -4149,6 +5085,10 @@ static void paint_content(cairo_t *cr)
     paint_position_editor(cr);
     paint_mode_picker(cr);
     paint_app_picker(cr);
+
+    /* Painted last so its hits sit above the page's hits in hit_at(). */
+    if (g_zoom_open)
+        paint_zoom_overlay(cr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -5198,6 +6138,11 @@ static void ui_activate(App *a, int idx)
                 g_ui.hover = -1;
             } else if (h->a == SEG_SCROLL || h->a == SEG_ACCEL) {
                 input_commit();
+            } else if (h->a == SEG_WX_UNITS) {
+                g_profile_cfg.fahrenheit = h->b;
+                profile_save();
+                ui_toast(h->b ? "Temperature set to Fahrenheit"
+                              : "Temperature set to Celsius");
             }
         }
         break;
@@ -5278,6 +6223,43 @@ static void ui_activate(App *a, int idx)
     case HIT_APP_PICKER_CLOSE:
         g_ui.app_picker_open = 0;
         break;
+
+    case HIT_WX_FIELD:
+        g_ui.mode_picker_open = 0;
+        g_ui.pos_editor_open = 0;
+        g_ui.app_picker_open = 0;
+        g_ui.wx_query_editing = 0;
+        g_ui.wx_editing = 1;
+        snprintf(g_ui.wx_location_input, sizeof g_ui.wx_location_input,
+                 "%s", g_profile_cfg.location);
+        g_ui.hover = -1;
+        g_ui.pressed = -1;
+        break;
+    case HIT_WX_QUERY_FIELD:
+        g_ui.wx_editing = 0;
+        g_ui.wx_query_editing = 1;
+        g_ui.hover = -1;
+        g_ui.pressed = -1;
+        break;
+    case HIT_WX_RESULT:
+        if (h->a >= 0 && h->a < g_wx_result_count) {
+            WxResult *r = &g_wx_results[h->a];
+            snprintf(g_profile_cfg.location, sizeof g_profile_cfg.location,
+                     "%s", r->name);
+            g_profile_cfg.lat = r->lat;
+            g_profile_cfg.lon = r->lon;
+            g_profile_cfg.have_coords = 1;
+            g_wx_result_count = 0;
+            g_ui.wx_query_editing = 0;
+            g_ui.wx_query_input[0] = '\0';
+            profile_save();
+            ui_toast("Weather location saved");
+        }
+        break;
+    case HIT_ZOOM_SCRIM:
+        zoom_cancel();
+        break;
+
     case HIT_BUTTON:
         if (h->a == BTN_START_ADD) {
             if (g_startup_count >= STARTUP_MAX) {
@@ -5336,6 +6318,29 @@ static void ui_activate(App *a, int idx)
             break;
         case BTN_MODE_CLOSE:
             g_ui.mode_picker_open = 0;
+            break;
+        case BTN_WX_SEARCH:
+            wx_search_start();
+            break;
+        case BTN_PHOTO_PICK:
+            profile_open_picker();
+            break;
+        case BTN_PHOTO_CLEAR:
+            g_profile_cfg.photo[0] = '\0';
+            g_profile_cfg.zoom = 1.0;
+            g_ui.sliders[SL_PHOTO_ZOOM] = 0.0;
+            if (g_photo_preview) {
+                cairo_surface_destroy(g_photo_preview);
+                g_photo_preview = NULL;
+            }
+            profile_save();
+            ui_toast("Profile photo removed");
+            break;
+        case BTN_ZOOM_CANCEL:
+            zoom_cancel();
+            break;
+        case BTN_ZOOM_SAVE:
+            zoom_accept();
             break;
         default:
             ui_toast("Preview only — no command was run");
@@ -5610,6 +6615,10 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
                        g_hits[pressed].a == SL_REPEAT ||
                        g_hits[pressed].a == SL_DELAY) {
                 input_commit();
+            } else if (g_hits[pressed].a == SL_PHOTO_ZOOM && !g_zoom_open) {
+                g_profile_cfg.zoom = photo_zoom_value();
+                profile_save();
+                ui_toast("Profile zoom saved");
             }
         }
         g_ui.pressed = -1;
@@ -5805,6 +6814,45 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
     if (g_ui.pos_editor_open && sym == XKB_KEY_Escape) {
         g_ui.pos_editor_open = 0;
         g_ui.disp_drag = -1;
+        return;
+    }
+
+    /* The zoom confirmation owns the keyboard until it is confirmed. */
+    if (g_zoom_open) {
+        if (sym == XKB_KEY_Escape)
+            zoom_cancel();
+        else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter)
+            zoom_accept();
+        return;
+    }
+
+    /* The weather location / search fields own the keyboard while editing. */
+    if (g_ui.wx_editing || g_ui.wx_query_editing) {
+        int typed = g_ui.wx_editing;
+        char *buf = typed ? g_ui.wx_location_input : g_ui.wx_query_input;
+        size_t n = typed ? sizeof g_ui.wx_location_input
+                         : sizeof g_ui.wx_query_input;
+        int r = text_input_key(a, key, sym, buf, n);
+        if (r == 2) {
+            if (typed) {
+                snprintf(g_profile_cfg.location,
+                         sizeof g_profile_cfg.location, "%s", buf);
+                /* A hand-typed name has no coordinates; the bar will resolve
+                 * it through Open-Meteo's geocoder as it did before. */
+                g_profile_cfg.have_coords = 0;
+                g_profile_cfg.lat = 0.0;
+                g_profile_cfg.lon = 0.0;
+                g_ui.wx_editing = 0;
+                profile_save();
+                ui_toast("Weather location saved");
+            } else {
+                g_ui.wx_query_editing = 0;
+                wx_search_start();
+            }
+        } else if (r == 3) {
+            g_ui.wx_editing = 0;
+            g_ui.wx_query_editing = 0;
+        }
         return;
     }
 
@@ -6266,6 +7314,9 @@ static int page_from_name(const char *s)
         return PAGE_DISPLAYS;
     if (!strcasecmp(s, "session") || !strcasecmp(s, "power"))
         return PAGE_SESSION;
+    if (!strcasecmp(s, "profile") || !strcasecmp(s, "weather") ||
+        !strcasecmp(s, "avatar"))
+        return PAGE_PROFILE;
     if (!strcasecmp(s, "about") || !strcasecmp(s, "info"))
         return PAGE_ABOUT;
 
@@ -6490,17 +7541,61 @@ static void ctl_cleanup(App *a)
     }
 }
 
+/* The XDG portal and the geocoding request live in a GLib main context.  We
+ * still own the Wayland event loop, so borrow GLib's poll fds for one poll()
+ * and dispatch its sources alongside Wayland/control-socket events. */
+static int g_gl_max_priority;
+static GPollFD *g_gl_pfds;
+static int g_gl_n_pfds, g_gl_pfds_cap, g_gl_have_prepare;
+
+static void
+glib_pump_prepare(int *timeout_ms)
+{
+    int gl_timeout = -1;
+    g_gl_have_prepare = 0;
+    if (!g_glctx || !g_main_context_acquire(g_glctx))
+        return;
+
+    g_main_context_prepare(g_glctx, &g_gl_max_priority);
+    int need = g_main_context_query(g_glctx, g_gl_max_priority, &gl_timeout,
+                                    NULL, 0);
+    if (need > g_gl_pfds_cap) {
+        g_gl_pfds = g_renew(GPollFD, g_gl_pfds, (gsize)need);
+        g_gl_pfds_cap = need;
+    }
+    g_gl_n_pfds = g_main_context_query(g_glctx, g_gl_max_priority, &gl_timeout,
+                                       g_gl_pfds, g_gl_pfds_cap);
+    if (gl_timeout >= 0 && (*timeout_ms < 0 || gl_timeout < *timeout_ms))
+        *timeout_ms = gl_timeout;
+    g_gl_have_prepare = 1;
+}
+
+static void
+glib_pump_dispatch(void)
+{
+    if (!g_gl_have_prepare)
+        return;
+    g_main_context_check(g_glctx, g_gl_max_priority, g_gl_pfds, g_gl_n_pfds);
+    g_main_context_dispatch(g_glctx);
+    g_main_context_release(g_glctx);
+    g_gl_have_prepare = 0;
+}
+
 /* Returns < 0 on a fatal display error, 0 otherwise. */
 static int pump_events(App *a, int timeout_ms)
 {
     if (wl_display_dispatch_pending(a->display) < 0)
         return -1;
 
+    glib_pump_prepare(&timeout_ms);
+
     /* Dispatching may have applied a configure that marked us dirty.  When
      * the caller asked to block indefinitely, return immediately so the
      * resize repaint is not held until some unrelated event arrives. */
-    if (timeout_ms < 0 && a->dirty)
+    if (timeout_ms < 0 && a->dirty) {
+        glib_pump_dispatch();
         return 0;
+    }
 
     int want_write = 0;
     if (wl_display_flush(a->display) < 0) {
@@ -6509,7 +7604,12 @@ static int pump_events(App *a, int timeout_ms)
         want_write = 1;
     }
 
-    struct pollfd pfd[3];
+#define MAX_POLL_FDS 32
+    struct pollfd pfd[MAX_POLL_FDS];
+    int gl_map[MAX_POLL_FDS];
+    for (int i = 0; i < MAX_POLL_FDS; i++)
+        gl_map[i] = -1;
+
     pfd[0].fd = wl_display_get_fd(a->display);
     pfd[0].events = POLLIN | (want_write ? POLLOUT : 0);
     pfd[0].revents = 0;
@@ -6532,7 +7632,21 @@ static int pump_events(App *a, int timeout_ms)
         nfds++;
     }
 
+    for (int i = 0; i < g_gl_n_pfds && nfds < MAX_POLL_FDS; i++) {
+        if (g_gl_pfds[i].fd < 0)
+            continue;
+        gl_map[nfds] = i;
+        pfd[nfds].fd = g_gl_pfds[i].fd;
+        pfd[nfds].events = (short)g_gl_pfds[i].events;
+        pfd[nfds].revents = 0;
+        nfds++;
+    }
+
     int pr = poll(pfd, (nfds_t)nfds, timeout_ms);
+    for (int i = 0; i < nfds; i++)
+        if (gl_map[i] >= 0)
+            g_gl_pfds[gl_map[i]].revents = (gushort)pfd[i].revents;
+    glib_pump_dispatch();
     if (pr < 0)
         return (errno == EINTR) ? 0 : -1;
     if (pr == 0)
@@ -6699,7 +7813,7 @@ static void usage(const char *argv0)
         "       %s --screenshot FILE [--page NAME]\n"
         "\n"
         "Pages: keybindings, startup, apps, rules, input,\n"
-        "       displays, session, about\n",
+        "       displays, session, profile, about\n",
         argv0, argv0);
 }
 
@@ -6749,6 +7863,8 @@ int main(int argc, char **argv)
     if (screenshot)
         return write_screenshot(screenshot, page) ? 0 : 1;
 
+    glib_services_init();
+
     App a;
     memset(&a, 0, sizeof a);
     g_app = &a;
@@ -6768,6 +7884,7 @@ int main(int argc, char **argv)
 
     if (!wayland_start(&a)) {
         app_cleanup(&a);
+        glib_services_cleanup();
         return 1;
     }
 
@@ -6784,6 +7901,10 @@ int main(int argc, char **argv)
     while (!a.quit && !g_signal_quit) {
         double now = mono_sec();
         g_ui.t = now - a.t0;
+        if (g_profile_dirty) {
+            a.dirty = 1;
+            g_profile_dirty = 0;
+        }
 
         int animating = g_ui.startup_adding || g_ui.terminal_editing;
         if (!animating && g_ui.toast[0]) {
@@ -6814,5 +7935,6 @@ int main(int argc, char **argv)
     if (a.configured)
         state_save(&a);
     app_cleanup(&a);
+    glib_services_cleanup();
     return 0;
 }
