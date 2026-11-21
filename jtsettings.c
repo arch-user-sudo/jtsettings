@@ -86,6 +86,20 @@ static double WIN_H = DESIGN_H;
 #define DISPLAY_VIEW_TOP    118.0
 #define DISPLAY_VIEW_BOTTOM (DISPLAY_BTN_Y - 10.0)
 
+/* About page: the content column has fixed document coordinates; only the
+ * viewport follows the window height. */
+#define ABOUT_VIEW_TOP    (HEADER_H + 4.0)
+#define ABOUT_VIEW_BOTTOM (WIN_H - 36.0)
+#define ABOUT_CARD_Y      304.0
+#define ABOUT_CARD_H      214.0
+#define ABOUT_BTN_Y       548.0
+#define ABOUT_NOTE_1_Y    614.0
+#define ABOUT_NOTE_2_Y    634.0
+#define ABOUT_LINKS_Y     686.0
+#define ABOUT_LINK_H      34.0
+#define ABOUT_LINK_GAP    8.0
+#define ABOUT_BOTTOM_PAD  20.0
+
 #define FONT_FAMILY "Liberation"
 
 /* Startup Apps page.  The list is loaded from ~/.config/jt/startup.conf;
@@ -512,7 +526,8 @@ enum {
     HIT_WX_FIELD,
     HIT_WX_QUERY_FIELD,
     HIT_WX_RESULT,
-    HIT_ZOOM_SCRIM
+    HIT_ZOOM_SCRIM,
+    HIT_REPO_LINK
 };
 
 enum {
@@ -549,6 +564,11 @@ typedef struct {
 #define MAX_HITS 192
 static Hit g_hits[MAX_HITS];
 static int g_hit_count;
+
+/* When set, add_hit() ignores controls scrolled outside this vertical band.
+ * The About page uses it for its scrolling content column. */
+static double g_hit_clip_top = -1.0;
+static double g_hit_clip_bottom = -1.0;
 
 typedef struct {
     const char *key;
@@ -655,6 +675,7 @@ typedef struct {
     int app_picker_cat;
     int app_picker_scroll;
     int disp_scroll;
+    double about_scroll;
     int disp_drag;
     double disp_drag_ox;
     double disp_drag_oy;
@@ -1169,6 +1190,10 @@ static int add_hit(int kind, int a, int b,
     if (kind >= HIT_DISP_RES && kind <= HIT_DISP_MODE &&
         !g_ui.mode_picker_open &&
         (y < DISPLAY_VIEW_TOP || y + h > DISPLAY_VIEW_BOTTOM))
+        return -1;
+
+    if (g_hit_clip_bottom > g_hit_clip_top &&
+        (y < g_hit_clip_top || y + h > g_hit_clip_bottom))
         return -1;
 
     if (g_hit_count >= MAX_HITS)
@@ -5179,45 +5204,86 @@ zoom_accept(void)
 /*  Page: About                                                        */
 /* ------------------------------------------------------------------ */
 
+/* Repositories cloned by jtupdater into ~/jtupdate/repos.  Keep in sync with
+ * g_repos in jtupdate.c. */
+typedef struct {
+    const char *name;
+    const char *url;
+} RepoLink;
+
+static const RepoLink ABOUT_REPOS[] = {
+    { "JTLab",       "https://github.com/arch-user-sudo/JTLab/activity" },
+    { "jtspeedtest", "https://github.com/arch-user-sudo/jtspeedtest/activity" },
+    { "jtnetworks",  "https://github.com/arch-user-sudo/jtnetworks/activity" },
+    { "jtlabwc",     "https://github.com/arch-user-sudo/jtlabwc/activity" },
+    { "jtupdater",   "https://github.com/arch-user-sudo/jtupdater/activity" },
+    { "jtsettings",  "https://github.com/arch-user-sudo/jtsettings/activity" },
+    { "jtwpi",       "https://github.com/arch-user-sudo/jtwpi/activity" },
+    { "jtpolkit",    "https://github.com/arch-user-sudo/jtpolkit/activity" },
+    { "jtgreeter",   "https://github.com/arch-user-sudo/jtgreeter/activity" },
+};
+#define ABOUT_REPO_COUNT ((int)(sizeof ABOUT_REPOS / sizeof ABOUT_REPOS[0]))
+
+static double about_max_scroll(void)
+{
+    double bottom = ABOUT_LINKS_Y + ABOUT_REPO_COUNT *
+        (ABOUT_LINK_H + ABOUT_LINK_GAP) + ABOUT_BOTTOM_PAD;
+    double max = bottom - ABOUT_VIEW_BOTTOM;
+    return max > 0.0 ? max : 0.0;
+}
+
 static void page_about(cairo_t *cr)
 {
     /* Center on the content column, not the whole window: the sidebar is
      * outside this column and was pulling these elements left. */
     double cx = CONTENT_X + CONTENT_W / 2.0;
+    double gx = CONTENT_X, gw = CONTENT_W;
+    double view_top = ABOUT_VIEW_TOP, view_bottom = ABOUT_VIEW_BOTTOM;
+    double view_h = view_bottom - view_top;
+    double max_scroll = about_max_scroll();
+
+    g_ui.about_scroll = clampd(g_ui.about_scroll, 0.0, max_scroll);
+    double sy = -g_ui.about_scroll;
+
+    cairo_save(cr);
+    cairo_rectangle(cr, gx, view_top, gw, view_h);
+    cairo_clip(cr);
+    g_hit_clip_top = view_top;
+    g_hit_clip_bottom = view_bottom;
 
     rgba(cr, C_ACCENT, 0.10);
-    cairo_arc(cr, cx, 150.0, 54.0, 0.0, 2.0 * PI);
+    cairo_arc(cr, cx, 150.0 + sy, 54.0, 0.0, 2.0 * PI);
     cairo_fill(cr);
     rgba(cr, C_ACCENT, 0.95);
-    rounded_rect(cr, cx - 30.0, 120.0, 60.0, 60.0, 16.0);
+    rounded_rect(cr, cx - 30.0, 120.0 + sy, 60.0, 60.0, 16.0);
     cairo_fill(cr);
     rgba(cr, C_ON_ACCENT, 0.92);
     for (int i = 0; i < 4; i++) {
         double h = 13.0 + i * 7.0;
-        rounded_rect(cr, cx - 19.0 + i * 10.0, 150.0 - h / 2.0,
+        rounded_rect(cr, cx - 19.0 + i * 10.0, 150.0 + sy - h / 2.0,
                      5.0, h, 2.5);
         cairo_fill(cr);
     }
 
     text_draw(cr, "JTLab Settings", 27.0, 700, C_FG, 0.98,
-              cx, 192.0, ALIGN_CENTER, 0.0);
+              cx, 192.0 + sy, ALIGN_CENTER, 0.0);
     text_draw(cr, "A calm place to shape your desktop", 11.0, 400,
-              C_DIM, 0.82, cx, 231.0, ALIGN_CENTER, 0.3);
+              C_DIM, 0.82, cx, 231.0 + sy, ALIGN_CENTER, 0.3);
 
     double pw = 164.0;
     rgba(cr, C_ACCENT, 0.12);
-    rounded_rect(cr, cx - pw / 2.0, 256.0, pw, 26.0, 13.0);
+    rounded_rect(cr, cx - pw / 2.0, 256.0 + sy, pw, 26.0, 13.0);
     cairo_fill(cr);
     rgba(cr, C_ACCENT, 0.5);
     cairo_set_line_width(cr, 1.0);
-    rounded_rect(cr, cx - pw / 2.0 + 0.5, 256.5, pw - 1.0, 25.0, 12.5);
+    rounded_rect(cr, cx - pw / 2.0 + 0.5, 256.5 + sy, pw - 1.0, 25.0, 12.5);
     cairo_stroke(cr);
     text_draw(cr, "0.1.0  ·  preview build", 9.0, 600, C_ACCENT, 0.95,
-              cx, 263.0, ALIGN_CENTER, 0.6);
+              cx, 263.0 + sy, ALIGN_CENTER, 0.6);
 
-    double gx = CONTENT_X, gy = 304.0, gw = CONTENT_W;
-    double btn_y = WIN_H - 172.0;
-    double gh = (btn_y - 30.0) - gy;
+    double gy = ABOUT_CARD_Y + sy;
+    double btn_y = ABOUT_BTN_Y + sy;
+    double gh = ABOUT_CARD_H;
     paint_card(cr, gx, gy, gw, gh);
 
     static const char *const keys[] = {
@@ -5251,11 +5317,42 @@ static void page_about(cairo_t *cr)
                  "Check for updates", 1, BTN_UPDATE);
 
     text_draw(cr, "Built for the JTLab desktop · made with care",
-              9.0, 400, C_FAINT, 0.8, cx, WIN_H - 106.0,
+              9.0, 400, C_FAINT, 0.8, cx, ABOUT_NOTE_1_Y + sy,
               ALIGN_CENTER, 0.3);
     text_draw(cr, "Source: ~/jtsettings/jtsettings.c",
-              8.5, 400, C_FAINT, 0.7, cx, WIN_H - 86.0,
+              8.5, 400, C_FAINT, 0.7, cx, ABOUT_NOTE_2_Y + sy,
               ALIGN_CENTER, 0.2);
+
+    section_label(cr, "REPOSITORY ACTIVITY", gx + 4.0,
+                  ABOUT_LINKS_Y - 18.0 + sy);
+    for (int i = 0; i < ABOUT_REPO_COUNT; i++) {
+        double ry = ABOUT_LINKS_Y + i * (ABOUT_LINK_H + ABOUT_LINK_GAP) + sy;
+        if (ry + ABOUT_LINK_H < view_top || ry > view_bottom)
+            continue;
+
+        int idx = add_hit(HIT_REPO_LINK, i, 0, gx, ry, gw, ABOUT_LINK_H);
+        int hot = hit_hover(idx);
+
+        rgba(cr, C_FG, hot ? 0.07 : 0.03);
+        rounded_rect(cr, gx, ry, gw, ABOUT_LINK_H, 7.0);
+        cairo_fill(cr);
+        rgba(cr, C_BORDER, hot ? 0.85 : 0.42);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, gx + 0.5, ry + 0.5, gw - 1.0,
+                     ABOUT_LINK_H - 1.0, 6.5);
+        cairo_stroke(cr);
+
+        text_draw(cr, ABOUT_REPOS[i].name, 11.0, 600,
+                  hot ? C_FG : 0xD6D6D6, 0.95,
+                  gx + 16.0, ry + 11.0, ALIGN_LEFT, 0.1);
+        text_draw(cr, "View activity →", 9.5, 500,
+                  hot ? C_ACCENT_HI : C_ACCENT, 0.9,
+                  gx + gw - 16.0, ry + 12.0, ALIGN_RIGHT, 0.2);
+    }
+
+    g_hit_clip_top = -1.0;
+    g_hit_clip_bottom = -1.0;
+    cairo_restore(cr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -5476,6 +5573,24 @@ launch_jtupdate(void)
     snprintf(cmd, sizeof cmd,
              "jtupdate '#%06X' >/dev/null 2>&1 &", accent_rgb & 0xFFFFFF);
     if (system(cmd) != 0) { }
+}
+
+/* Open a URL with the desktop's default browser.  Go through GIO rather than
+ * xdg-open: the latter's generic fallback mishandles .desktop Exec lines that
+ * start with an environment assignment (e.g. Zen's "DRI_PRIME=1 ..."), while
+ * GIO resolves the registered x-scheme-handler default correctly. */
+static int
+open_url(const char *url)
+{
+    GError *err = NULL;
+    int ok = g_app_info_launch_default_for_uri(url, NULL, &err);
+    if (!ok) {
+        fprintf(stderr, "jtsettings: cannot open %s: %s\n", url,
+                err ? err->message : "no default application");
+        if (err)
+            g_error_free(err);
+    }
+    return ok;
 }
 
 /* ------------------------------------------------------------------ */
@@ -6532,6 +6647,13 @@ static void ui_activate(App *a, int idx)
     case HIT_ZOOM_SCRIM:
         zoom_cancel();
         break;
+    case HIT_REPO_LINK:
+        if (h->a >= 0 && h->a < ABOUT_REPO_COUNT &&
+            open_url(ABOUT_REPOS[h->a].url))
+            ui_toast("Opening repository activity…");
+        else
+            ui_toast("Could not open browser");
+        break;
 
     case HIT_BUTTON:
         if (h->a == BTN_START_ADD) {
@@ -6555,7 +6677,10 @@ static void ui_activate(App *a, int idx)
             ui_toast("Preview only — window rules are not saved");
             break;
         case BTN_DOCS:
-            ui_toast("Preview only — docs would open in a browser");
+            if (open_url("https://github.com/arch-user-sudo/JTDE"))
+                ui_toast("Opening JTDE documentation…");
+            else
+                ui_toast("Could not open browser");
             break;
         case BTN_UPDATE:
             if (focus_app_window(a, "jtupdate"))
@@ -6946,6 +7071,19 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
             g_ui.disp_scroll = max_scroll;
         g_ui.hover = -1;
         a->dirty = 1;
+        return;
+    }
+
+    if (g_ui.page == PAGE_ABOUT) {
+        double next = g_ui.about_scroll + wl_fixed_to_double(value) * 2.0;
+        double clamped = clampd(next, 0.0, about_max_scroll());
+        if (clamped != g_ui.about_scroll) {
+            g_ui.about_scroll = clamped;
+            g_hit_count = 0;
+            g_ui.hover = -1;
+            g_ui.pressed = -1;
+            a->dirty = 1;
+        }
         return;
     }
 
