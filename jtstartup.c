@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -40,12 +41,20 @@
 #define MAX_DELAY_MS    60000
 #define STAGGER_MS      150
 
-static void
+/* Never read executable startup commands from a world-writable fallback. */
+static int
 config_path(char *buf, size_t n)
 {
     const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(buf, n, "%s/.config/%s/%s", home, CONFIG_DIR, CONFIG_FILE);
+    if (!home || !home[0]) {
+        struct passwd *pw = getpwuid(getuid());
+        home = (pw && pw->pw_dir && pw->pw_dir[0]) ? pw->pw_dir : NULL;
+    }
+    if (!home)
+        return 0;
+    int len = snprintf(buf, n, "%s/.config/%s/%s", home,
+                       CONFIG_DIR, CONFIG_FILE);
+    return len >= 0 && (size_t)len < n;
 }
 
 static char *
@@ -131,9 +140,14 @@ main(int argc, char **argv)
 
     char path[PATH_MAX_LEN];
     if (override) {
-        snprintf(path, sizeof path, "%s", override);
-    } else {
-        config_path(path, sizeof path);
+        int len = snprintf(path, sizeof path, "%s", override);
+        if (len < 0 || (size_t)len >= sizeof path) {
+            fprintf(stderr, "jtstartup: config path too long\n");
+            return 2;
+        }
+    } else if (!config_path(path, sizeof path)) {
+        fprintf(stderr, "jtstartup: cannot determine home directory\n");
+        return 1;
     }
 
     FILE *f = fopen(path, "r");

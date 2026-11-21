@@ -50,6 +50,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -171,6 +172,8 @@ static double mono_sec(void)
 
 static double clampd(double v, double lo, double hi)
 {
+    if (!isfinite(v))
+        return lo;
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
@@ -609,6 +612,11 @@ static ProfileCfg g_profile_cfg;
 static WxResult g_wx_results[WX_RESULTS];
 static int g_wx_result_count;
 static int g_wx_searching;
+static uint64_t g_wx_gen;
+typedef struct {
+    uint64_t gen;
+    SoupMessage *msg;
+} WxSearchOp;
 static char g_pending_photo[PROFILE_PATH_MAX];
 static double g_pending_zoom;
 static int g_zoom_open;
@@ -747,11 +755,43 @@ static void profile_open_picker(void);
 static void wx_search_start(void);
 static void glib_services_init(void);
 static void glib_services_cleanup(void);
+static void zoom_cancel(void);
 
 static void ui_toast(const char *msg)
 {
     snprintf(g_ui.toast, sizeof g_ui.toast, "%s", msg);
     g_ui.toast_t = mono_sec();
+}
+
+/* Page changes must not leave a modal, text field, or drag owning input. */
+static void ui_clear_interaction(void)
+{
+    g_ui.hover = -1;
+    g_ui.pressed = -1;
+    /* Page/modality changes invalidate the hit list from the previous paint. */
+    g_hit_count = 0;
+    g_ui.startup_adding = 0;
+    g_ui.terminal_editing = 0;
+    g_ui.wx_editing = 0;
+    g_ui.wx_query_editing = 0;
+    g_ui.mode_picker_open = 0;
+    g_ui.mode_picker_head = -1;
+    g_ui.pos_editor_open = 0;
+    g_ui.pos_layout_valid = 0;
+    g_ui.app_picker_open = 0;
+    g_ui.app_picker_scroll = 0;
+    g_ui.disp_drag = -1;
+    g_ui.kb_drag = 0;
+    if (g_zoom_open)
+        zoom_cancel();
+}
+
+static void ui_set_page(int page)
+{
+    if (page < 0 || page >= PAGE_COUNT || page == g_ui.page)
+        return;
+    ui_clear_interaction();
+    g_ui.page = page;
 }
 
 static void ui_init(void)
@@ -2000,6 +2040,7 @@ static void paint_mode_picker(cairo_t *cr)
     Head *h = head_get(g_ui.mode_picker_head);
     if (!h) {
         g_ui.mode_picker_open = 0;
+        g_ui.mode_picker_head = -1;
         return;
     }
 
@@ -2361,13 +2402,26 @@ static int g_startup_count;
 #define STARTUP_DELAY_MAX 60000L
 #define STARTUP_DELAY_SCALE 20000.0   /* slider 1.0 == 20 s */
 
+/* Config files contain commands and paths consumed by other JTLab tools, so a
+ * missing HOME must never silently redirect them to a world-writable /tmp. */
+static const char *
+user_home(void)
+{
+    const char *home = getenv("HOME");
+    if (home && home[0])
+        return home;
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && pw->pw_dir[0])
+        return pw->pw_dir;
+    return "/nonexistent";
+}
+
 /* Keep this path and the file format in sync with jtstartup.c. */
 static void
 startup_config_path(char *buf, size_t n)
 {
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(buf, n, "%s/.config/%s/%s", home, STARTUP_DIR, STARTUP_FILE);
+    snprintf(buf, n, "%s/.config/%s/%s", user_home(),
+             STARTUP_DIR, STARTUP_FILE);
 }
 
 static void
@@ -2506,9 +2560,7 @@ startup_load(void)
 static void
 input_config_path(char *buf, size_t n)
 {
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(buf, n, "%s/.config/%s/%s", home, INPUT_DIR, INPUT_FILE);
+    snprintf(buf, n, "%s/.config/%s/%s", user_home(), INPUT_DIR, INPUT_FILE);
 }
 
 static int
@@ -2664,6 +2716,11 @@ static GPid g_own_bus_pid = -1;
 static SoupSession *g_wx_session;
 static guint g_portal_signal;
 static char g_portal_path[256];
+static uint64_t g_portal_gen;
+typedef struct {
+    uint64_t gen;
+} PortalOp;
+static PortalOp *g_portal_op;
 
 /* Ask the bar to re-read profile.config so changes are live. */
 static void
@@ -2692,9 +2749,23 @@ jtlab_reload(void)
 static void
 profile_config_path(char *buf, size_t n)
 {
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(buf, n, "%s/.config/jt/%s", home, PROFILE_CONFIG_FILE);
+    snprintf(buf, n, "%s/.config/jt/%s", user_home(),
+             PROFILE_CONFIG_FILE);
+}
+
+static int
+profile_config_coord(const char *s, double lo, double hi, double *out)
+{
+    if (!s || !*s)
+        return 0;
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (end == s || *end || errno == ERANGE || !isfinite(v) ||
+        v < lo || v > hi)
+        return 0;
+    *out = v;
+    return 1;
 }
 
 static void
@@ -2705,6 +2776,7 @@ profile_config_load(void)
     FILE *f = fopen(path, "r");
     if (!f) return;
 
+    int have_lat = 0, have_lon = 0;
     char line[1024];
     while (fgets(line, sizeof line, f)) {
         char *s = startup_trim(line);
@@ -2724,11 +2796,11 @@ profile_config_load(void)
                 !strcmp(val, "fahrenheit") || !strcmp(val, "f") ||
                 !strcmp(val, "degrees") || !strcmp(val, "°f");
         } else if (!strcmp(key, "weather_latitude")) {
-            g_profile_cfg.lat = strtod(val, NULL);
-            g_profile_cfg.have_coords = 1;
+            have_lat = profile_config_coord(val, -90.0, 90.0,
+                                            &g_profile_cfg.lat);
         } else if (!strcmp(key, "weather_longitude")) {
-            g_profile_cfg.lon = strtod(val, NULL);
-            g_profile_cfg.have_coords = 1;
+            have_lon = profile_config_coord(val, -180.0, 180.0,
+                                            &g_profile_cfg.lon);
         } else if (!strcmp(key, "profile_photo")) {
             snprintf(g_profile_cfg.photo, sizeof g_profile_cfg.photo,
                      "%s", val);
@@ -2740,10 +2812,9 @@ profile_config_load(void)
     }
     fclose(f);
 
-    if (g_profile_cfg.have_coords &&
-        (g_profile_cfg.lat < -90.0 || g_profile_cfg.lat > 90.0 ||
-         g_profile_cfg.lon < -180.0 || g_profile_cfg.lon > 180.0))
-        g_profile_cfg.have_coords = 0;
+    /* A location is only usable when both coordinates were present and valid;
+     * otherwise the saved weather city would resolve to longitude zero. */
+    g_profile_cfg.have_coords = have_lat && have_lon;
 }
 
 static void
@@ -2845,13 +2916,76 @@ json_key(const char *js, const char *key)
     return NULL;
 }
 
+static const char *
+json_obj_end(const char *p)
+{
+    if (!p || *p != '{')
+        return NULL;
+    int depth = 0;
+    for (; *p; p++) {
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1])
+                    p++;
+                p++;
+            }
+            if (!*p)
+                return NULL;
+        } else if (*p == '{') {
+            depth++;
+        } else if (*p == '}') {
+            if (--depth == 0)
+                return p;
+        }
+    }
+    return NULL;
+}
+
+/* Lookup that cannot cross from one JSON object into the next.  Strings are
+ * skipped as whole tokens so an escaped \"name\" inside a value cannot be
+ * mistaken for a key in the surrounding object. */
+static const char *
+json_key_in(const char *p, const char *end, const char *key)
+{
+    if (!p || !end || end <= p)
+        return NULL;
+    size_t klen = strlen(key);
+    for (const char *q = p; q < end;) {
+        if (*q != '"') {
+            q++;
+            continue;
+        }
+
+        const char *str = q++;
+        while (q < end && *q != '"') {
+            if (*q == '\\' && q + 1 < end)
+                q++;
+            q++;
+        }
+        if (q >= end)
+            return NULL;
+
+        if ((size_t)(q - str) == klen + 1 && !strncmp(str + 1, key, klen)) {
+            const char *v = q + 1;
+            while (v < end && (*v == ' ' || *v == '\t' ||
+                               *v == '\n' || *v == '\r'))
+                v++;
+            if (v < end && *v == ':')
+                return v + 1;
+        }
+        q++;
+    }
+    return NULL;
+}
+
 static int
 json_num(const char *p, double *out)
 {
     if (!p) return 0;
     char *end;
     double v = strtod(p, &end);
-    if (end == p) return 0;
+    if (end == p || !isfinite(v)) return 0;
     *out = v;
     return 1;
 }
@@ -2859,7 +2993,9 @@ json_num(const char *p, double *out)
 static int
 json_str(const char *p, char *out, size_t n)
 {
-    if (!p || *p != '"' || n == 0) return 0;
+    if (!out || n == 0) return 0;
+    out[0] = '\0';
+    if (!p || *p != '"') return 0;
     p++;
     size_t i = 0;
     while (*p && *p != '"') {
@@ -2922,10 +3058,23 @@ wx_url_encode(const char *in, char *out, size_t n)
 static void
 wx_search_finish(GObject *src, GAsyncResult *res, gpointer data)
 {
-    (void)data;
+    WxSearchOp *op = data;
     GError *err = NULL;
     GBytes *body = soup_session_send_and_read_finish(SOUP_SESSION(src), res,
                                                      &err);
+    if (op && op->msg)
+        g_object_unref(op->msg);
+
+    /* A newer search has superseded this reply; leave its state untouched. */
+    if (!op || op->gen != g_wx_gen) {
+        if (body)
+            g_bytes_unref(body);
+        if (err)
+            g_error_free(err);
+        g_free(op);
+        return;
+    }
+
     g_wx_searching = 0;
     g_wx_result_count = 0;
     if (body) {
@@ -2937,17 +3086,26 @@ wx_search_finish(GObject *src, GAsyncResult *res, gpointer data)
             for (int i = 0; i < WX_RESULTS && arr; i++) {
                 const char *hit = json_arr_at(arr, i);
                 if (!hit) break;
+                const char *hit_end = json_obj_end(hit);
+                if (!hit_end) continue;
                 char name[64], country[64], admin[64];
                 name[0] = country[0] = admin[0] = '\0';
-                json_str(json_key(hit, "name"), name, sizeof name);
-                json_str(json_key(hit, "country"), country, sizeof country);
-                json_str(json_key(hit, "admin1"), admin, sizeof admin);
+                if (!json_str(json_key_in(hit, hit_end, "name"),
+                              name, sizeof name))
+                    continue;
+                json_str(json_key_in(hit, hit_end, "country"),
+                         country, sizeof country);
+                json_str(json_key_in(hit, hit_end, "admin1"),
+                         admin, sizeof admin);
                 WxResult *r = &g_wx_results[g_wx_result_count];
-                if (name[0])
-                    snprintf(r->name, sizeof r->name, "%s, %s",
-                             name, country[0] ? country : admin);
-                if (!json_num(json_key(hit, "latitude"), &r->lat) ||
-                    !json_num(json_key(hit, "longitude"), &r->lon))
+                r->name[0] = '\0';
+                r->lat = r->lon = 0.0;
+                snprintf(r->name, sizeof r->name, "%s, %s",
+                         name, country[0] ? country : admin);
+                if (!json_num(json_key_in(hit, hit_end, "latitude"),
+                              &r->lat) ||
+                    !json_num(json_key_in(hit, hit_end, "longitude"),
+                              &r->lon))
                     continue;
                 g_wx_result_count++;
             }
@@ -2959,6 +3117,7 @@ wx_search_finish(GObject *src, GAsyncResult *res, gpointer data)
     if (g_wx_result_count == 0)
         ui_toast("No matching places found");
     g_profile_dirty = 1;
+    g_free(op);
 }
 
 static void
@@ -2979,17 +3138,19 @@ wx_search_start(void)
              "https://geocoding-api.open-meteo.com/v1/search?name=%s"
              "&count=%d&language=en&format=json",
              enc, WX_RESULTS);
-    g_wx_searching = 1;
-    g_wx_result_count = 0;
-    g_profile_dirty = 1;
     SoupMessage *msg = soup_message_new("GET", url);
     if (!msg) {
-        g_wx_searching = 0;
         ui_toast("Could not build the search request");
         return;
     }
+    WxSearchOp *op = g_new0(WxSearchOp, 1);
+    op->gen = ++g_wx_gen;
+    op->msg = msg;
+    g_wx_searching = 1;
+    g_wx_result_count = 0;
+    g_profile_dirty = 1;
     soup_session_send_and_read_async(g_wx_session, msg, G_PRIORITY_DEFAULT,
-                                     NULL, wx_search_finish, NULL);
+                                     NULL, wx_search_finish, op);
 }
 
 /* ---- XDG file chooser portal ---- */
@@ -3001,6 +3162,7 @@ portal_unsubscribe(void)
         g_dbus_connection_signal_unsubscribe(g_bus, g_portal_signal);
         g_portal_signal = 0;
     }
+    g_portal_op = NULL;
 }
 
 static void
@@ -3008,7 +3170,11 @@ portal_response(GDBusConnection *conn, const char *sender, const char *path,
                 const char *iface, const char *signal, GVariant *params,
                 gpointer data)
 {
-    (void)conn; (void)sender; (void)path; (void)iface; (void)signal; (void)data;
+    (void)conn; (void)sender; (void)path; (void)iface; (void)signal;
+
+    PortalOp *op = data;
+    if (!op || op != g_portal_op || op->gen != g_portal_gen)
+        return;             /* response to a superseded picker */
 
     guint32 response = 0;
     GVariant *results = NULL;
@@ -3050,13 +3216,22 @@ portal_response(GDBusConnection *conn, const char *sender, const char *path,
 static void
 portal_open_cb(GObject *src, GAsyncResult *res, gpointer data)
 {
-    (void)data;
+    PortalOp *op = data;
     GError *err = NULL;
     GVariant *ret = g_dbus_connection_call_finish(G_DBUS_CONNECTION(src),
                                                   res, &err);
+    if (!op || op->gen != g_portal_gen) {
+        if (ret)
+            g_variant_unref(ret);
+        if (err)
+            g_error_free(err);
+        g_free(op);
+        return;
+    }
     if (!ret) {
         ui_toast("Could not open the file chooser portal");
         if (err) g_error_free(err);
+        g_free(op);
         g_profile_dirty = 1;
         return;
     }
@@ -3066,13 +3241,19 @@ portal_open_cb(GObject *src, GAsyncResult *res, gpointer data)
     portal_unsubscribe();
     if (handle) {
         snprintf(g_portal_path, sizeof g_portal_path, "%s", handle);
-        g_portal_signal = g_dbus_connection_signal_subscribe(
+        guint id = g_dbus_connection_signal_subscribe(
             g_bus, "org.freedesktop.portal.Desktop",
             "org.freedesktop.portal.Request", "Response",
             g_portal_path, NULL, G_DBUS_SIGNAL_FLAGS_NO_MATCH_RULE,
-            portal_response, NULL, NULL);
+            portal_response, op, g_free);
+        if (id) {
+            g_portal_signal = id;
+            g_portal_op = op;
+            op = NULL;      /* owned by the signal subscription */
+        }
     }
     g_variant_unref(ret);
+    g_free(op);
 }
 
 static void
@@ -3082,6 +3263,11 @@ profile_open_picker(void)
         ui_toast("File picker unavailable — no D-Bus session bus");
         return;
     }
+    if (g_portal_signal)
+        portal_unsubscribe();
+    PortalOp *op = g_new0(PortalOp, 1);
+    op->gen = ++g_portal_gen;
+
     GVariantBuilder opts;
     g_variant_builder_init(&opts, G_VARIANT_TYPE_VARDICT);
     g_variant_builder_add(&opts, "{sv}", "modal", g_variant_new_boolean(TRUE));
@@ -3094,7 +3280,7 @@ profile_open_picker(void)
         g_variant_new("(ss@a{sv})", "", "Choose profile picture",
                       g_variant_builder_end(&opts)),
         G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 10000,
-        NULL, portal_open_cb, NULL);
+        NULL, portal_open_cb, op);
     ui_toast("Waiting for the file chooser…");
     g_profile_dirty = 1;
 }
@@ -3197,9 +3383,7 @@ glib_services_cleanup(void)
 static void
 displays_config_path(char *buf, size_t n)
 {
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(buf, n, "%s/.config/jt/%s", home, DISPLAYS_FILE);
+    snprintf(buf, n, "%s/.config/jt/%s", user_home(), DISPLAYS_FILE);
 }
 static void
 displays_save(void)
@@ -3238,9 +3422,7 @@ displays_commit(void)
 static void
 keybinds_config_path(char *buf, size_t n)
 {
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(buf, n, "%s/.config/jt/%s", home, KEYBINDS_FILE);
+    snprintf(buf, n, "%s/.config/jt/%s", user_home(), KEYBINDS_FILE);
 }
 
 static void
@@ -3330,9 +3512,8 @@ defaultapps_valid_id(const char *s)
 static void
 defaultapps_config_path(char *buf, size_t n)
 {
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    snprintf(buf, n, "%s/.config/jt/%s", home, DEFAULT_APPS_FILE);
+    snprintf(buf, n, "%s/.config/jt/%s", user_home(),
+             DEFAULT_APPS_FILE);
 }
 
 static void
@@ -3696,6 +3877,31 @@ defaultapps_choose(int cat, int candidate)
     defaultapps_mark_dirty();
 }
 
+#define APP_PICKER_MAX_ROWS 10
+
+static int
+app_picker_visible_rows(int count, int custom)
+{
+    int rows = count < APP_PICKER_MAX_ROWS ? count : APP_PICKER_MAX_ROWS;
+    /* Category 0 keeps its last row for "Custom command...". */
+    if (custom && rows == APP_PICKER_MAX_ROWS)
+        rows--;
+    return rows;
+}
+
+static int
+app_picker_scroll_max(void)
+{
+    int cat = g_ui.app_picker_cat;
+    if (cat < 0 || cat >= APP_CAT_COUNT)
+        return 0;
+    int ids[MAX_DESKTOP_APPS];
+    int count = defaultapps_candidates(cat, ids, MAX_DESKTOP_APPS);
+    int visible = app_picker_visible_rows(count, cat == 0);
+    int max = count - visible;
+    return max > 0 ? max : 0;
+}
+
 static void
 app_picker_rect(double *px, double *py, double *pw, double *ph)
 {
@@ -3703,7 +3909,7 @@ app_picker_rect(double *px, double *py, double *pw, double *ph)
     int ids[MAX_DESKTOP_APPS];
     int count = (cat >= 0 && cat < APP_CAT_COUNT)
         ? defaultapps_candidates(cat, ids, MAX_DESKTOP_APPS) : 0;
-    int rows = count > 10 ? 10 : count;
+    int rows = app_picker_visible_rows(count, cat == 0);
     if (cat == 0)
         rows++;
 
@@ -3726,10 +3932,14 @@ paint_app_picker(cairo_t *cr)
 
     int ids[MAX_DESKTOP_APPS];
     int count = defaultapps_candidates(cat, ids, MAX_DESKTOP_APPS);
-    int max_rows = count > 10 ? 10 : count;
     int custom = cat == 0;
-    if (custom)
-        max_rows++;
+    int visible = app_picker_visible_rows(count, custom);
+    int max_scroll = app_picker_scroll_max();
+    if (g_ui.app_picker_scroll > max_scroll) {
+        g_ui.app_picker_scroll = max_scroll;
+        g_ui.hover = -1;
+        g_ui.pressed = -1;
+    }
 
     double px, py, pw, ph;
     app_picker_rect(&px, &py, &pw, &ph);
@@ -3743,28 +3953,22 @@ paint_app_picker(cairo_t *cr)
               px + 22.0, py + 18.0, ALIGN_LEFT, 0.0);
     text_draw(cr, "Select a detected application", 9.5, 400, C_DIM, 0.8,
               px + 22.0, py + 44.0, ALIGN_LEFT, 0.1);
+    if (max_scroll > 0) {
+        char hint[32];
+        snprintf(hint, sizeof hint, "Scroll · %d/%d",
+                 g_ui.app_picker_scroll + 1, count);
+        text_draw(cr, hint, 8.5, 500, C_FAINT, 0.8,
+                  px + pw - 22.0, py + 44.0, ALIGN_RIGHT, 0.1);
+    }
 
     if (count == 0 && !custom) {
         text_draw(cr, "No matching applications were found.", 10.0, 400,
                   C_DIM, 0.85, px + 22.0, py + 84.0, ALIGN_LEFT, 0.1);
     }
 
-    int shown = 0;
-    for (int i = 0; i < max_rows; i++) {
-        double ry = py + 76.0 + i * 36.0;
-        int is_custom = custom && i == count;
-        if (is_custom) {
-            int idx = add_hit(HIT_APP_PICK, cat, -1,
-                              px + 16.0, ry, pw - 32.0, 32.0);
-            int hot = hit_hover(idx);
-            rgba(cr, hot ? C_TRACK : C_CARD, hot ? 0.95 : 0.8);
-            rounded_rect(cr, px + 16.0, ry, pw - 32.0, 32.0, 7.0);
-            cairo_fill(cr);
-            text_draw(cr, "Custom command…", 10.5, 500, C_FG, 0.92,
-                      px + 30.0, ry + 9.0, ALIGN_LEFT, 0.1);
-            shown++;
-            continue;
-        }
+    for (int row = 0; row < visible; row++) {
+        int i = g_ui.app_picker_scroll + row;
+        double ry = py + 76.0 + row * 36.0;
         if (i >= count)
             continue;
 
@@ -3789,9 +3993,19 @@ paint_app_picker(cairo_t *cr)
                   on ? 1.0 : 0.92, px + 30.0, ry + 8.0, ALIGN_LEFT, 0.1);
         text_draw(cr, d->id, 8.5, 400, C_FAINT, 0.75,
                   px + pw - 30.0, ry + 9.0, ALIGN_RIGHT, 0.1);
-        shown++;
     }
-    (void)shown;
+
+    if (custom) {
+        double ry = py + 76.0 + visible * 36.0;
+        int idx = add_hit(HIT_APP_PICK, cat, -1,
+                          px + 16.0, ry, pw - 32.0, 32.0);
+        int hot = hit_hover(idx);
+        rgba(cr, hot ? C_TRACK : C_CARD, hot ? 0.95 : 0.8);
+        rounded_rect(cr, px + 16.0, ry, pw - 32.0, 32.0, 7.0);
+        cairo_fill(cr);
+        text_draw(cr, "Custom command…", 10.5, 500, C_FG, 0.92,
+                  px + 30.0, ry + 9.0, ALIGN_LEFT, 0.1);
+    }
 
     double bx = px + pw - 22.0 - 92.0;
     double by = py + ph - 20.0 - 32.0;
@@ -5112,7 +5326,9 @@ typedef struct {
 
 typedef struct {
     struct wl_output *output;
+    uint32_t registry_name;
     int32_t scale;
+    int used;
     int entered;
     App *app;
 } Output;
@@ -5185,6 +5401,11 @@ struct App {
 
     int ctl_fd;
     int ctl_client_fd;
+    /* Filesystem identity of our bound socket path.  fstat() on an AF_UNIX
+     * fd returns a sockfs inode on Linux, so it cannot be compared with the
+     * path's lstat() result. */
+    dev_t ctl_dev;
+    ino_t ctl_ino;
     char ctl_buf[256];
     size_t ctl_len;
 };
@@ -5193,6 +5414,42 @@ static void defaultapps_mark_dirty(void)
 {
     if (g_app)
         g_app->dirty = 1;
+}
+
+/* Hits and several UI fields store a g_heads[] slot, not a stable output ID.
+ * When a head goes away, invalidate every reference before the slot can be
+ * reused by a different monitor. */
+static void head_ui_invalidate_slot(int slot)
+{
+    if (slot < 0 || slot >= MAX_HEADS)
+        return;
+
+    if (g_ui.mode_picker_head == slot) {
+        g_ui.mode_picker_open = 0;
+        g_ui.mode_picker_head = -1;
+    }
+    if (g_ui.disp_drag == slot) {
+        g_ui.disp_drag = -1;
+        g_ui.disp_drag_ox = 0.0;
+        g_ui.disp_drag_oy = 0.0;
+    }
+    g_ui.pos_layout_valid = 0;
+    g_ui.hover = -1;
+    g_ui.pressed = -1;
+    g_hit_count = 0;
+    if (g_app)
+        g_app->dirty = 1;
+}
+
+/* Clear head state only; callers remain responsible for destroying any live
+ * Wayland objects (head_finished handles its own, app_cleanup handles the
+ * leftover objects on shutdown). */
+static void heads_clear(void)
+{
+    for (int i = 0; i < MAX_HEADS; i++) {
+        head_ui_invalidate_slot(i);
+        memset(&g_heads[i], 0, sizeof g_heads[i]);
+    }
 }
 
 /* Raise the first open window whose app_id matches, as JTLab does. */
@@ -5504,6 +5761,8 @@ static void recalc_scale(App *a)
 
     int s = 0;
     for (int i = 0; i < a->output_count; i++) {
+        if (!a->outputs[i].used)
+            continue;
         if (a->outputs[i].entered && a->outputs[i].scale > s)
             s = a->outputs[i].scale;
     }
@@ -5515,6 +5774,7 @@ static void recalc_scale(App *a)
         return;
 
     a->scale = s;
+    a->dirty = 1;
     if (a->surface && wl_surface_get_version(a->surface) >= 3)
         wl_surface_set_buffer_scale(a->surface, s);
 
@@ -5667,6 +5927,8 @@ static void surface_enter(void *data, struct wl_surface *surface,
     (void)surface;
     App *a = data;
     for (int i = 0; i < a->output_count; i++) {
+        if (!a->outputs[i].used)
+            continue;
         if (a->outputs[i].output == output) {
             a->outputs[i].entered = 1;
             break;
@@ -5681,6 +5943,8 @@ static void surface_leave(void *data, struct wl_surface *surface,
     (void)surface;
     App *a = data;
     for (int i = 0; i < a->output_count; i++) {
+        if (!a->outputs[i].used)
+            continue;
         if (a->outputs[i].output == output) {
             a->outputs[i].entered = 0;
             break;
@@ -5857,6 +6121,7 @@ static void head_scale(void *data, struct zwlr_output_head_v1 *head,
 static void head_finished(void *data, struct zwlr_output_head_v1 *head)
 {
     Head *h = data;
+    head_ui_invalidate_slot((int)(h - g_heads));
     h->used = 0;
     h->head = NULL;
     h->current_mode = NULL;
@@ -5971,13 +6236,22 @@ static void manager_finished(void *data,
     if (a->output_manager == manager)
         a->output_manager = NULL;
     g_output_manager_available = 0;
+    /* heads_clear() only drops our bookkeeping; release any protocol objects
+     * that still outlived their own finished events. */
     for (int i = 0; i < MAX_HEADS; i++) {
-        g_heads[i].used = 0;
-        g_heads[i].head = NULL;
-        g_heads[i].current_mode = NULL;
-        for (int j = 0; j < g_heads[i].mode_count; j++)
-            g_heads[i].modes[j].obj = NULL;
+        Head *h = &g_heads[i];
+        for (int j = 0; j < h->mode_count; j++) {
+            if (h->modes[j].obj) {
+                zwlr_output_mode_v1_destroy(h->modes[j].obj);
+                h->modes[j].obj = NULL;
+            }
+        }
+        if (h->head) {
+            zwlr_output_head_v1_destroy(h->head);
+            h->head = NULL;
+        }
     }
+    heads_clear();
     zwlr_output_manager_v1_destroy(manager);
     a->dirty = 1;
 }
@@ -6108,11 +6382,8 @@ static void ui_activate(App *a, int idx)
     Hit *h = &g_hits[idx];
     switch (h->kind) {
     case HIT_NAV:
-        if (h->a >= 0 && h->a < PAGE_COUNT) {
-            g_ui.page = h->a;
-            g_ui.hover = -1;
-            g_ui.pressed = -1;
-        }
+        if (h->a >= 0 && h->a < PAGE_COUNT)
+            ui_set_page(h->a);
         break;
     case HIT_TOGGLE:
         if (h->a >= 0 && h->a < TOG_COUNT) {
@@ -6205,6 +6476,7 @@ static void ui_activate(App *a, int idx)
                 head_choose_resolution(hh, res[h->b].w, res[h->b].h);
         }
         g_ui.mode_picker_open = 0;
+        g_ui.mode_picker_head = -1;
         break;
     }
 
@@ -6214,6 +6486,7 @@ static void ui_activate(App *a, int idx)
         g_ui.app_picker_cat = h->a;
         g_ui.app_picker_scroll = 0;
         g_ui.app_picker_open = 1;
+        g_hit_count = 0;
         g_ui.hover = -1;
         g_ui.pressed = -1;
         break;
@@ -6295,6 +6568,7 @@ static void ui_activate(App *a, int idx)
         case BTN_POSITION:
             g_ui.pos_editor_open = 1;
             g_ui.mode_picker_open = 0;
+            g_ui.mode_picker_head = -1;
             g_ui.pos_layout_valid = 0;
             g_ui.disp_drag = -1;
             g_ui.hover = -1;
@@ -6312,12 +6586,14 @@ static void ui_activate(App *a, int idx)
         case BTN_DISPLAYS_RESET:
             displays_sync_all();
             g_ui.mode_picker_open = 0;
+            g_ui.mode_picker_head = -1;
             g_ui.pos_editor_open = 0;
             g_ui.disp_drag = -1;
             ui_toast("Display changes reset");
             break;
         case BTN_MODE_CLOSE:
             g_ui.mode_picker_open = 0;
+            g_ui.mode_picker_head = -1;
             break;
         case BTN_WX_SEARCH:
             wx_search_start();
@@ -6498,8 +6774,10 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
                 if (h)
                     mode_picker_rect(h, &px, &py, &pw, &ph);
                 if (!h || x < px || x > px + pw ||
-                    y < py || y > py + ph)
+                    y < py || y > py + ph) {
                     g_ui.mode_picker_open = 0;
+                    g_ui.mode_picker_head = -1;
+                }
             }
         }
         a->dirty = 1;
@@ -6637,6 +6915,24 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
     if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
         return;
 
+    if (g_ui.app_picker_open) {
+        int max = app_picker_scroll_max();
+        int next = g_ui.app_picker_scroll +
+                   (int)lround(wl_fixed_to_double(value));
+        if (next < 0)
+            next = 0;
+        if (next > max)
+            next = max;
+        if (next != g_ui.app_picker_scroll) {
+            g_ui.app_picker_scroll = next;
+            g_hit_count = 0;
+            g_ui.hover = -1;
+            g_ui.pressed = -1;
+            a->dirty = 1;
+        }
+        return;
+    }
+
     if (g_ui.page == PAGE_DISPLAYS && !g_ui.pos_editor_open &&
         !g_ui.mode_picker_open) {
         int max_scroll = head_count() * 220 -
@@ -6758,6 +7054,20 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard,
     (void)data; (void)keyboard; (void)serial; (void)surface;
 }
 
+static size_t
+utf8_seq_len(unsigned char c)
+{
+    if (c < 0x80)
+        return 1;
+    if ((c & 0xE0) == 0xC0)
+        return 2;
+    if ((c & 0xF0) == 0xE0)
+        return 3;
+    if ((c & 0xF8) == 0xF0)
+        return 4;
+    return 0;
+}
+
 /* Shared single-line text editing.  Returns 0 if the key was not consumed,
  * 1 if it edited the buffer, 2 for Enter and 3 for Escape. */
 static int
@@ -6769,8 +7079,11 @@ text_input_key(App *a, uint32_t key, xkb_keysym_t sym, char *buf, size_t n)
         return 3;
     if (sym == XKB_KEY_BackSpace) {
         size_t len = strlen(buf);
+        while (len > 0 && ((unsigned char)buf[len - 1] & 0xC0) == 0x80)
+            len--;
         if (len > 0)
-            buf[len - 1] = '\0';
+            len--;
+        buf[len] = '\0';
         return 1;
     }
     if (sym == XKB_KEY_Delete) {
@@ -6782,12 +7095,31 @@ text_input_key(App *a, uint32_t key, xkb_keysym_t sym, char *buf, size_t n)
     int got = xkb_state_key_get_utf8(a->xkb_state, key + 8, tmp, sizeof tmp);
     if (got > 0) {
         size_t len = strlen(buf);
-        for (int i = 0; i < got; i++) {
+        size_t room = n > 0 ? n - len - 1 : 0;
+        for (int i = 0; i < got && room > 0; ) {
             unsigned char c = (unsigned char)tmp[i];
-            if (c < 0x20 || c == 0x7F)
+            size_t clen = utf8_seq_len(c);
+            if (clen == 0 || (size_t)(got - i) < clen) {
+                i++;
                 continue;
-            if (len + 1 < n)
-                buf[len++] = (char)c;
+            }
+            int valid = 1;
+            for (size_t j = 1; j < clen; j++) {
+                if (((unsigned char)tmp[i + j] & 0xC0) != 0x80) {
+                    valid = 0;
+                    break;
+                }
+            }
+            if (!valid || (clen == 1 && (c < 0x20 || c == 0x7F))) {
+                i++;
+                continue;
+            }
+            if (clen > room)
+                break;
+            memcpy(buf + len, tmp + i, clen);
+            len += clen;
+            room -= clen;
+            i += (int)clen;
         }
         buf[len] = '\0';
     }
@@ -6807,13 +7139,21 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
     a->dirty = 1;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
 
-    if (g_ui.mode_picker_open && sym == XKB_KEY_Escape) {
-        g_ui.mode_picker_open = 0;
+    /* A modal owns the keyboard.  Never let a page shortcut or quit key act
+     * behind one: pointer input is already gated the same way. */
+    if (g_ui.mode_picker_open) {
+        if (sym == XKB_KEY_Escape) {
+            g_ui.mode_picker_open = 0;
+            g_ui.mode_picker_head = -1;
+        }
         return;
     }
-    if (g_ui.pos_editor_open && sym == XKB_KEY_Escape) {
-        g_ui.pos_editor_open = 0;
-        g_ui.disp_drag = -1;
+    if (g_ui.pos_editor_open) {
+        if (sym == XKB_KEY_Escape) {
+            g_ui.pos_editor_open = 0;
+            g_ui.pos_layout_valid = 0;
+            g_ui.disp_drag = -1;
+        }
         return;
     }
 
@@ -6826,8 +7166,42 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
         return;
     }
 
+    if (g_ui.app_picker_open) {
+        if (sym == XKB_KEY_Escape) {
+            g_ui.app_picker_open = 0;
+        } else if (sym == XKB_KEY_Down || sym == XKB_KEY_Page_Down ||
+                   sym == XKB_KEY_Up || sym == XKB_KEY_Page_Up) {
+            int max = app_picker_scroll_max();
+            int step = 1;
+            if (sym == XKB_KEY_Page_Down || sym == XKB_KEY_Page_Up) {
+                int cat = g_ui.app_picker_cat;
+                int ids[MAX_DESKTOP_APPS];
+                int count = (cat >= 0 && cat < APP_CAT_COUNT)
+                    ? defaultapps_candidates(cat, ids, MAX_DESKTOP_APPS) : 0;
+                step = app_picker_visible_rows(count, cat == 0);
+            }
+            int next = g_ui.app_picker_scroll;
+            if (sym == XKB_KEY_Down || sym == XKB_KEY_Page_Down)
+                next += step;
+            else
+                next -= step;
+            if (next < 0)
+                next = 0;
+            if (next > max)
+                next = max;
+            if (next != g_ui.app_picker_scroll) {
+                g_ui.app_picker_scroll = next;
+                g_hit_count = 0;
+                g_ui.hover = -1;
+                g_ui.pressed = -1;
+            }
+        }
+        return;
+    }
+
     /* The weather location / search fields own the keyboard while editing. */
-    if (g_ui.wx_editing || g_ui.wx_query_editing) {
+    if (g_ui.page == PAGE_PROFILE &&
+        (g_ui.wx_editing || g_ui.wx_query_editing)) {
         int typed = g_ui.wx_editing;
         char *buf = typed ? g_ui.wx_location_input : g_ui.wx_query_input;
         size_t n = typed ? sizeof g_ui.wx_location_input
@@ -6867,11 +7241,6 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
         return;
     }
 
-    if (g_ui.app_picker_open && sym == XKB_KEY_Escape) {
-        g_ui.app_picker_open = 0;
-        return;
-    }
-
     /* The default terminal field owns the keyboard while it is open. */
     if (g_ui.page == PAGE_DEFAULT_APPS && g_ui.terminal_editing) {
         int r = text_input_key(a, key, sym, g_ui.terminal_input,
@@ -6889,25 +7258,18 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
     }
     if (sym == XKB_KEY_Down || sym == XKB_KEY_Right ||
         sym == XKB_KEY_Page_Down) {
-        g_ui.page = (g_ui.page + 1) % PAGE_COUNT;
-        g_ui.hover = -1;
-        g_ui.pressed = -1;
+        ui_set_page((g_ui.page + 1) % PAGE_COUNT);
         return;
     }
     if (sym == XKB_KEY_Up || sym == XKB_KEY_Left ||
         sym == XKB_KEY_Page_Up) {
-        g_ui.page = (g_ui.page + PAGE_COUNT - 1) % PAGE_COUNT;
-        g_ui.hover = -1;
-        g_ui.pressed = -1;
+        ui_set_page((g_ui.page + PAGE_COUNT - 1) % PAGE_COUNT);
         return;
     }
     if (sym >= XKB_KEY_1 && sym <= XKB_KEY_9) {
         int p = (int)(sym - XKB_KEY_1);
-        if (p < PAGE_COUNT) {
-            g_ui.page = p;
-            g_ui.hover = -1;
-            g_ui.pressed = -1;
-        }
+        if (p < PAGE_COUNT)
+            ui_set_page(p);
     }
 }
 
@@ -7170,16 +7532,30 @@ static void registry_global(void *data, struct wl_registry *registry,
                 a->toplevel_manager, &foreign_toplevel_manager_listener, a);
         }
     } else if (!strcmp(interface, wl_output_interface.name)) {
-        if (a->output_count < MAX_OUTPUTS) {
-            Output *o = &a->outputs[a->output_count];
-            o->output = wl_registry_bind(registry, name,
-                                         &wl_output_interface,
-                                         version < 2 ? version : 2);
-            o->scale = 1;
-            o->entered = 0;
-            o->app = a;
-            wl_output_add_listener(o->output, &output_listener, o);
-            a->output_count++;
+        /* Keep slots stable: live wl_output listeners point at &outputs[i]. */
+        int slot = -1;
+        for (int i = 0; i < MAX_OUTPUTS; i++) {
+            if (!a->outputs[i].used) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot >= 0) {
+            struct wl_output *out = wl_registry_bind(registry, name,
+                                                     &wl_output_interface,
+                                                     version < 2 ? version : 2);
+            if (out) {
+                Output *o = &a->outputs[slot];
+                o->output = out;
+                o->registry_name = name;
+                o->scale = 1;
+                o->used = 1;
+                o->entered = 0;
+                o->app = a;
+                wl_output_add_listener(out, &output_listener, o);
+                if (slot + 1 > a->output_count)
+                    a->output_count = slot + 1;
+            }
         }
     }
 }
@@ -7187,7 +7563,22 @@ static void registry_global(void *data, struct wl_registry *registry,
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name)
 {
-    (void)data; (void)registry; (void)name;
+    (void)registry;
+    App *a = data;
+    if (!a)
+        return;
+
+    for (int i = 0; i < a->output_count; i++) {
+        Output *o = &a->outputs[i];
+        if (!o->used || o->registry_name != name)
+            continue;
+        if (o->output)
+            wl_output_destroy(o->output);
+        memset(o, 0, sizeof *o);
+        recalc_scale(a);
+        a->dirty = 1;
+        return;
+    }
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -7283,11 +7674,32 @@ static int wayland_start(App *a)
 /*  Live control socket                                                */
 /* ------------------------------------------------------------------ */
 
+#define CTL_MAX_ACCEPTS 16
+#define CTL_MAX_READS   64
+
 static void ctl_path(char *buf, size_t n)
 {
     const char *rt = getenv("XDG_RUNTIME_DIR");
-    if (!rt || !rt[0]) rt = "/tmp";
-    snprintf(buf, n, "%s/jtsettings-ctl.sock", rt);
+    int len;
+    if (rt && rt[0])
+        len = snprintf(buf, n, "%s/jtsettings-ctl.sock", rt);
+    else
+        len = snprintf(buf, n, "/tmp/jtsettings-ctl-%u.sock",
+                       (unsigned)getuid());
+    if (len < 0 || (size_t)len >= n)
+        buf[0] = '\0';
+}
+
+/* Remove only the socket path we actually created, never another instance's
+ * replacement. */
+static void ctl_unlink_owned(const char *path, dev_t dev, ino_t ino)
+{
+    if (!path || !*path || (dev == 0 && ino == 0))
+        return;
+    struct stat st;
+    if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode) &&
+        st.st_dev == dev && st.st_ino == ino)
+        unlink(path);
 }
 
 static int page_from_name(const char *s)
@@ -7349,7 +7761,9 @@ static void ctl_handle_line(App *a, char *line)
     if (!strcmp(line, "reset")) {
         displays_sync_all();
         g_ui.mode_picker_open = 0;
+        g_ui.mode_picker_head = -1;
         g_ui.pos_editor_open = 0;
+        g_ui.pos_layout_valid = 0;
         g_ui.disp_drag = -1;
         ui_toast("Display changes reset");
         a->dirty = 1;
@@ -7403,9 +7817,7 @@ static void ctl_handle_line(App *a, char *line)
             arg++;
         int page = page_from_name(arg);
         if (page >= 0 && page < PAGE_COUNT) {
-            g_ui.page = page;
-            g_ui.hover = -1;
-            g_ui.pressed = -1;
+            ui_set_page(page);
             a->dirty = 1;
         }
     }
@@ -7444,9 +7856,15 @@ static void ctl_process(App *a, int flush)
 static void ctl_read_client(App *a)
 {
     char buf[128];
-    for (;;) {
+    /* Bound one poll cycle so a client streaming data cannot starve Wayland
+     * input.  Anything left over is picked up by the next POLLIN. */
+    for (int reads = 0; reads < CTL_MAX_READS; reads++) {
         ssize_t n = read(a->ctl_client_fd, buf, sizeof(buf));
         if (n > 0) {
+            if (a->ctl_len >= sizeof(a->ctl_buf) - 1) {
+                ctl_close_client(a);
+                return;
+            }
             size_t room = sizeof(a->ctl_buf) - 1 - a->ctl_len;
             if ((size_t)n > room) {
                 ctl_close_client(a);
@@ -7475,7 +7893,7 @@ static void ctl_read_client(App *a)
 
 static void ctl_accept(App *a)
 {
-    for (;;) {
+    for (int accepted = 0; accepted < CTL_MAX_ACCEPTS; accepted++) {
         int fd = accept4(a->ctl_fd, NULL, NULL,
                          SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
@@ -7511,17 +7929,39 @@ static int ctl_start(App *a)
         perror("jtsettings: control socket");
         return 0;
     }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    /* A Unix socket's mode is fixed at bind() time.  Without this, a missing
+     * XDG_RUNTIME_DIR leaves a world-connectable control socket in /tmp. */
+    mode_t old_umask = umask(0077);
+    int bound = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
+    if (bound < 0) {
         fprintf(stderr, "jtsettings: cannot bind %s: %s\n",
                 path, strerror(errno));
         close(fd);
         return 0;
     }
+
+    /* Remember the path's real filesystem identity for cleanup. */
+    struct stat bound_st;
+    if (lstat(path, &bound_st) != 0) {
+        fprintf(stderr, "jtsettings: cannot stat bound socket %s: %s\n",
+                path, strerror(errno));
+        close(fd);
+        return 0;
+    }
+    if (!S_ISSOCK(bound_st.st_mode)) {
+        fprintf(stderr, "jtsettings: bound path is not a socket: %s\n", path);
+        close(fd);
+        return 0;
+    }
+    a->ctl_dev = bound_st.st_dev;
+    a->ctl_ino = bound_st.st_ino;
+
     if (listen(fd, 4) < 0) {
         fprintf(stderr, "jtsettings: cannot listen on %s: %s\n",
                 path, strerror(errno));
         close(fd);
-        unlink(path);
+        ctl_unlink_owned(path, a->ctl_dev, a->ctl_ino);
         return 0;
     }
 
@@ -7533,11 +7973,13 @@ static void ctl_cleanup(App *a)
 {
     ctl_close_client(a);
     if (a->ctl_fd >= 0) {
-        close(a->ctl_fd);
-        a->ctl_fd = -1;
+        /* Another instance may have rebound our path after it was removed.
+         * Only unlink when it still refers to the socket we bound. */
         char path[256];
         ctl_path(path, sizeof(path));
-        unlink(path);
+        ctl_unlink_owned(path, a->ctl_dev, a->ctl_ino);
+        close(a->ctl_fd);
+        a->ctl_fd = -1;
     }
 }
 
@@ -7581,26 +8023,45 @@ glib_pump_dispatch(void)
     g_gl_have_prepare = 0;
 }
 
+/* Finish an acquired prepare cycle without running callbacks.  Used on fatal
+ * exits before dispatch so the context is not left locked by this thread. */
+static void
+glib_pump_cancel(void)
+{
+    if (!g_glctx || !g_gl_have_prepare)
+        return;
+    for (int i = 0; i < g_gl_n_pfds; i++)
+        g_gl_pfds[i].revents = 0;
+    g_main_context_check(g_glctx, g_gl_max_priority, g_gl_pfds, g_gl_n_pfds);
+    g_main_context_release(g_glctx);
+    g_gl_have_prepare = 0;
+}
+
 /* Returns < 0 on a fatal display error, 0 otherwise. */
 static int pump_events(App *a, int timeout_ms)
 {
     if (wl_display_dispatch_pending(a->display) < 0)
         return -1;
 
+    /* GLib may replace an infinite wait with one of its own timeouts; keep
+     * the caller's original intent for the dirty-repaint shortcut. */
+    int block_forever = timeout_ms < 0;
     glib_pump_prepare(&timeout_ms);
 
     /* Dispatching may have applied a configure that marked us dirty.  When
      * the caller asked to block indefinitely, return immediately so the
      * resize repaint is not held until some unrelated event arrives. */
-    if (timeout_ms < 0 && a->dirty) {
+    if (block_forever && a->dirty) {
         glib_pump_dispatch();
         return 0;
     }
 
     int want_write = 0;
     if (wl_display_flush(a->display) < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            glib_pump_cancel();
             return -1;
+        }
         want_write = 1;
     }
 
@@ -7693,8 +8154,8 @@ static void app_cleanup(App *a)
                     zwlr_output_mode_v1_destroy(h->modes[j].obj);
             if (h->head)
                 zwlr_output_head_v1_destroy(h->head);
-            memset(h, 0, sizeof *h);
         }
+        heads_clear();
         zwlr_output_manager_v1_destroy(a->output_manager);
         a->output_manager = NULL;
     }
@@ -7819,6 +8280,10 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
+    /* ui_init() calls xdg-mime via popen(), and glib_services_init() may
+     * spawn dbus-daemon.  Reset an inherited SIG_IGN before either runs. */
+    signal(SIGCHLD, SIG_DFL);
+
     if (!accent_cli(&argc, argv)) {
         usage(argv[0]);
         return 2;
@@ -7868,12 +8333,6 @@ int main(int argc, char **argv)
     App a;
     memset(&a, 0, sizeof a);
     g_app = &a;
-    /*
-     * Some launchers (e.g. JTLab) ignore SIGCHLD to auto-reap their own
-     * children. Inherited across exec, this breaks system()/popen()/waitpid()
-     * with ECHILD, so reset to default for jtsettings' own subprocesses.
-     */
-    signal(SIGCHLD, SIG_DFL);
     g_output_manager_available = 0;
     memset(g_heads, 0, sizeof g_heads);
     a.scale = 1;
@@ -7906,7 +8365,8 @@ int main(int argc, char **argv)
             g_profile_dirty = 0;
         }
 
-        int animating = g_ui.startup_adding || g_ui.terminal_editing;
+        int animating = g_ui.startup_adding || g_ui.terminal_editing ||
+                        g_ui.wx_editing || g_ui.wx_query_editing;
         if (!animating && g_ui.toast[0]) {
             double age = now - g_ui.toast_t;
             if (age >= 0.0 && age < 3.0)
