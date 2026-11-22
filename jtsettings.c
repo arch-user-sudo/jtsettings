@@ -2181,8 +2181,8 @@ typedef struct {
 /* These mirror the built-in key_combos table in jtlabwc.c.  The page is a
  * read-only view of what the compositor actually binds at startup. */
 static const KeybindRow KEYBINDS[] = {
-    { "Next window",          "Window",    { "Super", "J" }, 2 },
-    { "Previous window",      "Window",    { "Super", "K" }, 2 },
+    { "Next window",          "Window",    { "Super", "K" }, 2 },
+    { "Previous window",      "Window",    { "Super", "J" }, 2 },
     { "Open terminal",        "Session",   { "Super", "Return" }, 2 },
     { "Close window",         "Window",    { "Super", "Shift", "Q" }, 3 },
     { "Toggle maximize",      "Window",    { "Super", "A" }, 2 },
