@@ -2133,15 +2133,15 @@ static void paint_footer(cairo_t *cr)
     paint_divider(cr, SIDEBAR_W, WIN_H - 30.0, WIN_W - SIDEBAR_W);
 
     double age = mono_sec() - g_ui.toast_t;
-    const char *msg = g_ui.page == PAGE_STARTUP
-        ? "AUTOSTART · ~/.config/jt/startup.conf"
-        : g_ui.page == PAGE_KEYBINDINGS
-        ? "BUILT-IN SHORTCUTS · jtlabwc"
-        : g_ui.page == PAGE_INPUT
-        ? "INPUT · ~/.config/jt/input.conf"
-        : g_ui.page == PAGE_PROFILE
-        ? "PROFILE · ~/.config/jt/profile.config"
-        : "PREVIEW · changes are not saved";
+    const char *msg = g_ui.page == PAGE_KEYBINDINGS
+        ? "BUILT-IN SHORTCUTS - Shortcuts cannot be altered!"
+        : g_ui.page == PAGE_ABOUT
+        ? "CLICK TO OPEN LINKS - Make sure default web browser is set!"
+        : (g_ui.page == PAGE_STARTUP || g_ui.page == PAGE_DEFAULT_APPS ||
+           g_ui.page == PAGE_DISPLAYS || g_ui.page == PAGE_INPUT ||
+           g_ui.page == PAGE_PROFILE)
+        ? "FEATURE IMPLEMENTED - Changes are saved!"
+        : "PREVIEW · changes are not saved!";
     unsigned col = C_FAINT;
     double alpha = 0.9;
 
