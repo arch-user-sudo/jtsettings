@@ -781,7 +781,24 @@ static void zoom_cancel(void);
 static void ui_toast(const char *msg)
 {
     snprintf(g_ui.toast, sizeof g_ui.toast, "%s", msg);
-    g_ui.toast_t = mono_sec();
+    /* Use the frame-clocked UI timebase so the fade matches the frames that
+     * actually present it, not a free-running wall clock. */
+    g_ui.toast_t = g_ui.t;
+}
+
+/* Everything in this UI that animates (caret blink, toast fade) is driven by
+ * g_ui.t, which only advances from the wl_surface.frame callback. */
+static int ui_animating(void)
+{
+    if (g_ui.startup_adding || g_ui.terminal_editing ||
+        g_ui.wx_editing || g_ui.wx_query_editing)
+        return 1;
+    if (g_ui.toast[0]) {
+        double age = g_ui.t - g_ui.toast_t;
+        if (age >= 0.0 && age < 3.0)
+            return 1;
+    }
+    return 0;
 }
 
 /* Page changes must not leave a modal, text field, or drag owning input. */
@@ -2132,7 +2149,7 @@ static void paint_footer(cairo_t *cr)
 {
     paint_divider(cr, SIDEBAR_W, WIN_H - 30.0, WIN_W - SIDEBAR_W);
 
-    double age = mono_sec() - g_ui.toast_t;
+    double age = g_ui.t - g_ui.toast_t;
     const char *msg = g_ui.page == PAGE_KEYBINDINGS
         ? "BUILT-IN SHORTCUTS - Shortcuts cannot be altered!"
         : g_ui.page == PAGE_ABOUT
@@ -5494,7 +5511,7 @@ struct App {
     struct zwlr_output_configuration_v1 *pending_config;
 
     int quit;
-    double t0;
+    double anim_last;     /* monotonic time of the last frame step */
 
     int ctl_fd;
     int ctl_client_fd;
@@ -5810,8 +5827,25 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
 {
     (void)time;
     App *a = data;
+    if (a->frame_cb == cb) a->frame_cb = NULL;
     wl_callback_destroy(cb);
-    a->frame_cb = NULL;
+
+    /* Advance the sole UI timebase on the compositor's frame clock, with a
+     * clamped monotonic delta so a stalled loop never makes effects jump. */
+    double now = mono_sec();
+    double dt = now - a->anim_last;
+    a->anim_last = now;
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.12) dt = 0.12;
+    g_ui.t += dt;
+
+    if (ui_animating()) {
+        a->dirty = 1;
+    } else if (g_ui.toast[0] && g_ui.t - g_ui.toast_t >= 3.0) {
+        /* Draw one last frame with the expired toast gone. */
+        g_ui.toast[0] = '\0';
+        a->dirty = 1;
+    }
 }
 
 static const struct wl_callback_listener frame_listener = {
@@ -8493,23 +8527,15 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    a.t0 = mono_sec();
+    a.anim_last = mono_sec();
 
     while (!a.quit && !g_signal_quit) {
-        double now = mono_sec();
-        g_ui.t = now - a.t0;
         if (g_profile_dirty) {
             a.dirty = 1;
             g_profile_dirty = 0;
         }
 
-        int animating = g_ui.startup_adding || g_ui.terminal_editing ||
-                        g_ui.wx_editing || g_ui.wx_query_editing;
-        if (!animating && g_ui.toast[0]) {
-            double age = now - g_ui.toast_t;
-            if (age >= 0.0 && age < 3.0)
-                animating = 1;
-        }
+        int animating = ui_animating();
 
         if (a.configured && (a.dirty || animating) && !a.frame_cb) {
             app_draw(&a);
