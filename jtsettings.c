@@ -13,7 +13,8 @@
  * Most of this is a GUI preview: controls are drawn and react locally, but
  * Startup Apps writes ~/.config/jt/startup.conf (read by jtstartup), the
  * new Profile page writes ~/.config/jt/profile.config (read by JTLab), and
- * Appearance writes ~/.config/jt/appearance.conf (read by jtlabwc).  The
+ * Appearance writes ~/.config/jt/appearance.conf (read by jtlabwc, jtfiles
+ * and jtwpi).  The
  * Profile tab picks the weather location and temperature unit, and chooses a
  * profile photo through the XDG file-chooser portal with a zoom step before
  * the choice is saved.  The left panel mirrors the areas a real settings app
@@ -967,7 +968,7 @@ static void ui_init(void)
     g_ui.toggles[TOG_MIDDLE] = 0;
     g_ui.toggles[TOG_PRIMARY_A] = 1;
     g_ui.toggles[TOG_PRIMARY_B] = 0;
-    g_ui.toggles[TOG_BORDER_ANIM] = 1;
+    g_ui.toggles[TOG_BORDER_ANIM] = 0;
 
     g_ui.sliders[SL_POINTER] = 0.52;
     g_ui.sliders[SL_REPEAT] = (45.0 - 15.0) / 65.0;
@@ -2990,16 +2991,16 @@ input_load(void)
     return 1;
 }
 
-/* Ask jtlabwc to re-read its configuration files.  A missing compositor is
+/* Ask a companion app to re-read its configuration files.  A missing app is
  * not an error: the settings stay on disk and are picked up at the next
  * session start. */
 static void
-jtlabwc_reload(void)
+app_reload(const char *sockname)
 {
     const char *rt = getenv("XDG_RUNTIME_DIR");
     char path[256];
-    snprintf(path, sizeof path, "%s/jtlabwc-ctl.sock",
-             (rt && *rt) ? rt : "/tmp");
+    snprintf(path, sizeof path, "%s/%s",
+             (rt && *rt) ? rt : "/tmp", sockname);
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     if (strlen(path) >= sizeof addr.sun_path)
@@ -3015,6 +3016,10 @@ jtlabwc_reload(void)
     }
     close(fd);
 }
+
+static void jtlabwc_reload(void) { app_reload("jtlabwc-ctl.sock"); }
+static void jtfiles_reload(void) { app_reload("jtfiles-ctl.sock"); }
+static void jtwpi_reload(void)   { app_reload("jtwpi-ctl.sock"); }
 
 static void
 input_commit(void)
@@ -3099,6 +3104,8 @@ appearance_commit(void)
 {
     appearance_save();
     jtlabwc_reload();
+    jtfiles_reload();
+    jtwpi_reload();
     ui_toast(g_ui.toggles[TOG_BORDER_ANIM]
              ? "Border animation enabled"
              : "Border animation disabled");
