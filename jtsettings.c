@@ -11,13 +11,14 @@
  *   ./jtstartup                    (run the saved startup apps)
  *
  * Most of this is a GUI preview: controls are drawn and react locally, but
- * Startup Apps writes ~/.config/jt/startup.conf (read by jtstartup) and the
- * new Profile page writes ~/.config/jt/profile.config (read by JTLab).  The
+ * Startup Apps writes ~/.config/jt/startup.conf (read by jtstartup), the
+ * new Profile page writes ~/.config/jt/profile.config (read by JTLab), and
+ * Appearance writes ~/.config/jt/appearance.conf (read by jtlabwc).  The
  * Profile tab picks the weather location and temperature unit, and chooses a
  * profile photo through the XDG file-chooser portal with a zoom step before
  * the choice is saved.  The left panel mirrors the areas a real settings app
  * would cover: keybindings, startup apps, window rules, input, displays,
- * session behaviour, profile and an about page.
+ * appearance, session behaviour, profile and an about page.
  *
  * The palette and typography follow ~/JTLab/config.h: #030303 background,
  * #404040 borders, #E8A03C amber accent by default, #66B366 success green,
@@ -436,6 +437,7 @@ enum {
     PAGE_RULES,
     PAGE_INPUT,
     PAGE_DISPLAYS,
+    PAGE_APPEARANCE,
     PAGE_SESSION,
     PAGE_PROFILE,
     PAGE_ABOUT,
@@ -444,7 +446,7 @@ enum {
 
 static const char *PAGE_NAMES[PAGE_COUNT] = {
     "Keybindings", "Startup Apps", "Default Apps", "Window Rules", "Input",
-    "Displays", "Session", "Profile", "About",
+    "Displays", "Appearance", "Session", "Profile", "About",
 };
 
 static const char *PAGE_SUBS[PAGE_COUNT] = {
@@ -454,6 +456,7 @@ static const char *PAGE_SUBS[PAGE_COUNT] = {
     "Match windows and shape how they appear",
     "Pointer, touchpad and keyboard behaviour",
     "Outputs, resolution, refresh rate and scale",
+    "Accent, window borders and frame styling",
     "Idle, lock and power commands",
     "Weather location, units and your JTLab avatar",
     "Version and build information",
@@ -476,6 +479,7 @@ enum {
     TOG_LAST_WS,
     TOG_PRIMARY_A,
     TOG_PRIMARY_B,
+    TOG_BORDER_ANIM,
     TOG_COUNT
 };
 
@@ -755,6 +759,11 @@ static void jtlabwc_reload(void);
 static void input_commit(void);
 static int input_toggle(int toggle);
 
+/* Appearance settings live in ~/.config/jt/appearance.conf. */
+static int appearance_load(void);
+static void appearance_save(void);
+static void appearance_commit(void);
+
 /* The default terminal command lives in ~/.config/jt/keybinds.conf. */
 static int keybinds_load(void);
 static void keybinds_save(void);
@@ -872,6 +881,7 @@ static void ui_init(void)
     g_ui.toggles[TOG_LAST_WS] = 0;
     g_ui.toggles[TOG_PRIMARY_A] = 1;
     g_ui.toggles[TOG_PRIMARY_B] = 0;
+    g_ui.toggles[TOG_BORDER_ANIM] = 1;
 
     g_ui.sliders[SL_POINTER] = 0.52;
     g_ui.sliders[SL_REPEAT] = (45.0 - 15.0) / 65.0;
@@ -898,6 +908,9 @@ static void ui_init(void)
 
     /* Saved pointer settings override the defaults in the same way. */
     (void)input_load();
+
+    /* Border animation preference, shared with jtlabwc. */
+    (void)appearance_load();
 
     /* Default terminal command; falls back to footclient. */
     (void)keybinds_load();
@@ -1694,6 +1707,20 @@ static void paint_nav_icon(cairo_t *cr, int page, double x, double y,
         cairo_line_to(cr, x + 13.0, y + 16.5);
         cairo_stroke(cr);
         break;
+    case PAGE_APPEARANCE:
+        /* palette: a rounded tile with two paint dots */
+        rounded_rect(cr, x + 1.5, y + 2.0, 15.0, 14.0, 3.0);
+        cairo_stroke(cr);
+        cairo_new_path(cr);
+        cairo_arc(cr, x + 6.0, y + 7.0, 1.6, 0.0, 2.0 * PI);
+        cairo_fill(cr);
+        cairo_new_path(cr);
+        cairo_arc(cr, x + 12.0, y + 7.0, 1.6, 0.0, 2.0 * PI);
+        cairo_fill(cr);
+        cairo_move_to(cr, x + 5.0, y + 12.0);
+        cairo_line_to(cr, x + 13.0, y + 12.0);
+        cairo_stroke(cr);
+        break;
     case PAGE_SESSION:
         /* power: a ring with a gap at the top and a stem into the centre */
         cairo_arc(cr, cx, cy, 6.6, -PI / 2.0 + 0.55,
@@ -2156,7 +2183,7 @@ static void paint_footer(cairo_t *cr)
         ? "CLICK TO OPEN LINKS - Make sure default web browser is set!"
         : (g_ui.page == PAGE_STARTUP || g_ui.page == PAGE_DEFAULT_APPS ||
            g_ui.page == PAGE_DISPLAYS || g_ui.page == PAGE_INPUT ||
-           g_ui.page == PAGE_PROFILE)
+           g_ui.page == PAGE_APPEARANCE || g_ui.page == PAGE_PROFILE)
         ? "FEATURE IMPLEMENTED - Changes are saved!"
         : "PREVIEW · changes are not saved!";
     unsigned col = C_FAINT;
@@ -2746,6 +2773,86 @@ input_commit(void)
     input_save();
     jtlabwc_reload();
     ui_toast("Input settings applied");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Appearance                                                         */
+/* ------------------------------------------------------------------ */
+
+#define APPEARANCE_DIR       "jt"
+#define APPEARANCE_FILE      "appearance.conf"
+#define APPEARANCE_PATH_MAX  512
+
+/* Keep this path and the keys in sync with jtlabwc.c. */
+static void
+appearance_config_path(char *buf, size_t n)
+{
+    snprintf(buf, n, "%s/.config/%s/%s", user_home(),
+             APPEARANCE_DIR, APPEARANCE_FILE);
+}
+
+static int
+appearance_load(void)
+{
+    char path[APPEARANCE_PATH_MAX];
+    appearance_config_path(path, sizeof path);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *s = startup_trim(line);
+        if (!*s || *s == '#') continue;
+
+        char *eq = strchr(s, '=');
+        char *key = "";
+        char *value = s;
+        if (eq) {
+            *eq = '\0';
+            key = startup_trim(s);
+            value = startup_trim(eq + 1);
+        }
+        if (!*value) continue;
+
+        /* jtlabwc also accepts a bare true/false with no key. */
+        if (!*key || !strcasecmp(key, "accent_border_animation") ||
+            !strcasecmp(key, "jtlabwc_border_anim_enabled")) {
+            if (!strcasecmp(value, "true") || !strcmp(value, "1"))
+                g_ui.toggles[TOG_BORDER_ANIM] = 1;
+            else if (!strcasecmp(value, "false") || !strcmp(value, "0"))
+                g_ui.toggles[TOG_BORDER_ANIM] = 0;
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+static void
+appearance_save(void)
+{
+    char path[APPEARANCE_PATH_MAX];
+    appearance_config_path(path, sizeof path);
+    startup_mkdirs(path);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "# jtsettings appearance configuration\n");
+    fprintf(f, "# Written by jtsettings, read by jtlabwc.\n");
+    fprintf(f, "accent_border_animation=%s\n",
+            g_ui.toggles[TOG_BORDER_ANIM] ? "true" : "false");
+    fclose(f);
+}
+
+static void
+appearance_commit(void)
+{
+    appearance_save();
+    jtlabwc_reload();
+    ui_toast(g_ui.toggles[TOG_BORDER_ANIM]
+             ? "Border animation enabled"
+             : "Border animation disabled");
 }
 
 /* ------------------------------------------------------------------ */
@@ -4807,6 +4914,61 @@ static void page_displays(cairo_t *cr)
 }
 
 
+/*  Page: Appearance                                                    */
+/* ------------------------------------------------------------------ */
+
+static void page_appearance(cairo_t *cr)
+{
+    double inner = CONTENT_W - 36.0;
+    double lx = CONTENT_X + 18.0;
+
+    section_label(cr, "WINDOW BORDERS", CONTENT_X, 102.0);
+
+    double cy = 122.0;
+    double ch = 142.0;
+    paint_card(cr, CONTENT_X, cy, CONTENT_W, ch);
+
+    text_draw(cr, "Focus accent", 12.0, 600, 0xE8E8E8, 0.95,
+              lx, cy + 14.0, ALIGN_LEFT, 0.1);
+    paint_toggle_row(cr, lx, cy + 46.0, inner, "Border animation",
+                     "Sweep the accent around the frame when focus changes",
+                     g_ui.toggles[TOG_BORDER_ANIM], TOG_BORDER_ANIM);
+    paint_divider(cr, lx, cy + 96.0, inner);
+    text_draw(cr, "Saved to ~/.config/jt/appearance.conf", 8.8, 400,
+              C_DIM, 0.8, lx, cy + 106.0, ALIGN_LEFT, 0.1);
+
+    section_label(cr, "PREVIEW", CONTENT_X, cy + ch + 30.0);
+
+    /* Leave a real gap under the PREVIEW label instead of butting the card
+     * right up against the text. */
+    double py = cy + ch + 50.0;
+    paint_card(cr, CONTENT_X, py, CONTENT_W, 116.0);
+
+    text_draw(cr, "Accent", 11.0, 500, C_DIM, 0.85,
+              lx, py + 20.0, ALIGN_LEFT, 0.1);
+    rgba(cr, C_ACCENT, 1.0);
+    rounded_rect(cr, lx + 50.0, py + 10.0, 18.0, 18.0, 5.0);
+    cairo_fill(cr);
+    char hex[16];
+    snprintf(hex, sizeof hex, "#%06X", C_ACCENT);
+    text_draw(cr, hex, 11.0, 600, 0xE0E0E0, 0.95,
+              lx + 76.0, py + 21.0, ALIGN_LEFT, 0.1);
+
+    text_draw(cr, "Interface font", 11.0, 500, C_DIM, 0.85,
+              lx, py + 56.0, ALIGN_LEFT, 0.1);
+    text_draw(cr, FONT_FAMILY, 11.0, 600, 0xE0E0E0, 0.95,
+              lx + 92.0, py + 56.0, ALIGN_LEFT, 0.1);
+
+    text_draw(cr, "Frame radius comes from jtlabwc's theme.", 8.8, 400,
+              C_FAINT, 0.8, lx, py + 86.0, ALIGN_LEFT, 0.1);
+
+    text_wrap(cr,
+        "The border switch is applied by jtlabwc immediately. Accent colours "
+        "come from JTLab and its live control socket.",
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, py + 132.0, CONTENT_W, 2);
+}
+
+
 /*  Page: Session                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -5403,6 +5565,7 @@ static void paint_content(cairo_t *cr)
     case PAGE_RULES: page_rules(cr); break;
     case PAGE_INPUT: page_input(cr); break;
     case PAGE_DISPLAYS: page_displays(cr); break;
+    case PAGE_APPEARANCE: page_appearance(cr); break;
     case PAGE_SESSION: page_session(cr); break;
     case PAGE_PROFILE: page_profile(cr); break;
     case PAGE_ABOUT: page_about(cr); break;
@@ -6539,6 +6702,8 @@ static void ui_activate(App *a, int idx)
             g_ui.toggles[h->a] = !g_ui.toggles[h->a];
             if (input_toggle(h->a))
                 input_commit();
+            else if (h->a == TOG_BORDER_ANIM)
+                appearance_commit();
         }
         break;
     case HIT_START_TOGGLE:
@@ -7896,6 +8061,9 @@ static int page_from_name(const char *s)
     if (!strcasecmp(s, "displays") || !strcasecmp(s, "display") ||
         !strcasecmp(s, "outputs"))
         return PAGE_DISPLAYS;
+    if (!strcasecmp(s, "appearance") || !strcasecmp(s, "appear") ||
+        !strcasecmp(s, "theme"))
+        return PAGE_APPEARANCE;
     if (!strcasecmp(s, "session") || !strcasecmp(s, "power"))
         return PAGE_SESSION;
     if (!strcasecmp(s, "profile") || !strcasecmp(s, "weather") ||
@@ -8446,7 +8614,7 @@ static void usage(const char *argv0)
         "       %s --screenshot FILE [--page NAME]\n"
         "\n"
         "Pages: keybindings, startup, apps, rules, input,\n"
-        "       displays, session, profile, about\n",
+        "       displays, appearance, session, profile, about\n",
         argv0, argv0);
 }
 
