@@ -17,8 +17,8 @@
  * Profile tab picks the weather location and temperature unit, and chooses a
  * profile photo through the XDG file-chooser portal with a zoom step before
  * the choice is saved.  The left panel mirrors the areas a real settings app
- * would cover: keybindings, startup apps, window rules, input, displays,
- * appearance, session behaviour, profile and an about page.
+ * would cover: keybindings, startup apps, default apps, input, displays,
+ * appearance, profile and an about page.
  *
  * The palette and typography follow ~/JTLab/config.h: #030303 background,
  * #404040 borders, #E8A03C amber accent by default, #66B366 success green,
@@ -74,11 +74,23 @@
 static double WIN_W = DESIGN_W;
 static double WIN_H = DESIGN_H;
 
+/* The window may be resized well below the design size. */
+#define MIN_W 668.0
+#define MIN_H 432.0
+
 #define SIDEBAR_W 252.0
 #define HEADER_H  84.0
 
 #define CONTENT_X (SIDEBAR_W + 36.0)
 #define CONTENT_W (WIN_W - CONTENT_X - 36.0)
+
+/* Sidebar navigation: fixed-size rows that scroll when they no longer fit. */
+#define NAV_TOP       100.0
+#define NAV_PITCH     41.0
+#define NAV_BOX_H     38.0
+#define NAV_BOTTOM_PAD 136.0
+#define NAV_TRACK_X   (SIDEBAR_W - 10.0)
+#define NAV_TRACK_TOP (NAV_TOP + 2.0)
 
 /* Displays page: the action row is anchored close to the bottom of the
  * content column, and the scrolling display-card viewport ends just above
@@ -86,6 +98,8 @@ static double WIN_H = DESIGN_H;
 #define DISPLAY_BTN_Y       (WIN_H - 110.0)
 #define DISPLAY_VIEW_TOP    118.0
 #define DISPLAY_VIEW_BOTTOM (DISPLAY_BTN_Y - 10.0)
+#define DISP_HCONTENT_W     (DESIGN_W - CONTENT_X - 36.0)
+#define DISP_HSCROLL_Y      (DISPLAY_VIEW_BOTTOM + 2.0)
 
 /* About page: the content column has fixed document coordinates; only the
  * viewport follows the window height. */
@@ -138,7 +152,6 @@ static double WIN_H = DESIGN_H;
 #define C_CARD_TOP  0x131416
 #define C_TRACK     0x1A1A1C
 #define C_GREEN     0x66B366
-#define C_RED       0xC05A5A
 
 /* The accent can be overridden at launch or by the control socket.  These
  * aliases keep the drawing code unchanged while allowing live replacement. */
@@ -434,30 +447,26 @@ enum {
     PAGE_KEYBINDINGS,
     PAGE_STARTUP,
     PAGE_DEFAULT_APPS,
-    PAGE_RULES,
     PAGE_INPUT,
     PAGE_DISPLAYS,
     PAGE_APPEARANCE,
-    PAGE_SESSION,
     PAGE_PROFILE,
     PAGE_ABOUT,
     PAGE_COUNT
 };
 
 static const char *PAGE_NAMES[PAGE_COUNT] = {
-    "Keybindings", "Startup Apps", "Default Apps", "Window Rules", "Input",
-    "Displays", "Appearance", "Session", "Profile", "About",
+    "Keybindings", "Startup Apps", "Default Apps", "Input", "Displays",
+    "Appearance", "Profile", "About",
 };
 
 static const char *PAGE_SUBS[PAGE_COUNT] = {
     "Every shortcut jtlabwc listens for",
     "Programs launched together with your session",
     "Handlers for links, files, media and the terminal",
-    "Match windows and shape how they appear",
     "Pointer, touchpad and keyboard behaviour",
     "Outputs, resolution, refresh rate and scale",
     "Accent, window borders and frame styling",
-    "Idle, lock and power commands",
     "Weather location, units and your JTLab avatar",
     "Version and build information",
 };
@@ -468,15 +477,7 @@ enum {
     TOG_DRAG,
     TOG_DWT,
     TOG_LEFT,
-    TOG_RULE_PIP,
-    TOG_RULE_TERM,
-    TOG_RULE_WEB,
     TOG_MIDDLE,
-    TOG_IDLE_LOCK,
-    TOG_DIM,
-    TOG_LOCK_SUSPEND,
-    TOG_RESTORE,
-    TOG_LAST_WS,
     TOG_PRIMARY_A,
     TOG_PRIMARY_B,
     TOG_BORDER_ANIM,
@@ -488,7 +489,6 @@ enum {
     SL_REPEAT,
     SL_DELAY,
     SL_START_DELAY,
-    SL_IDLE,
     SL_PHOTO_ZOOM,
     SL_COUNT
 };
@@ -510,6 +510,14 @@ enum {
 enum {
     HIT_NONE,
     HIT_NAV,
+    HIT_NAV_SCROLL,
+    HIT_STARTUP_SCROLL,
+    HIT_DEFAPP_SCROLL,
+    HIT_INPUT_SCROLL,
+    HIT_DISP_HSCROLL,
+    HIT_PROFILE_SCROLL,
+    HIT_APPEARANCE_SCROLL,
+    HIT_KB_FILTER_SCROLL,
     HIT_TOGGLE,
     HIT_SLIDER,
     HIT_SEGMENT,
@@ -535,12 +543,8 @@ enum {
 };
 
 enum {
-    BTN_NEW_RULE,
     BTN_DOCS,
     BTN_UPDATE,
-    BTN_LOGOUT,
-    BTN_REBOOT,
-    BTN_SHUTDOWN,
     BTN_START_ADD,
     BTN_POSITION,
     BTN_POS_DONE,
@@ -569,10 +573,14 @@ typedef struct {
 static Hit g_hits[MAX_HITS];
 static int g_hit_count;
 
-/* When set, add_hit() ignores controls scrolled outside this vertical band.
- * The About page uses it for its scrolling content column. */
+/* When set, add_hit() ignores controls scrolled outside this band, and
+ * applies the active horizontal scroll offset to the stored hit rect. */
 static double g_hit_clip_top = -1.0;
 static double g_hit_clip_bottom = -1.0;
+static double g_hit_clip_left = -1.0;
+static double g_hit_clip_right = -1.0;
+static double g_hit_dx = 0.0;
+static double g_hit_dy = 0.0;
 
 typedef struct {
     const char *key;
@@ -669,6 +677,46 @@ typedef struct {
     int kb_drag_moved;
     double kb_drag_y;
     double kb_drag_scroll;
+    double kb_filter_scroll;
+    int kb_filter_drag;
+    int kb_filter_drag_moved;
+    double kb_filter_drag_x;
+    double kb_filter_drag_scroll;
+    double startup_scroll;
+    int startup_drag;
+    int startup_drag_moved;
+    double startup_drag_y;
+    double startup_drag_scroll;
+    double defapp_scroll;
+    int defapp_drag;
+    int defapp_drag_moved;
+    double defapp_drag_y;
+    double defapp_drag_scroll;
+    double input_scroll;
+    int input_drag;
+    int input_drag_moved;
+    double input_drag_y;
+    double input_drag_scroll;
+    double disp_hscroll;
+    int disp_hdrag;
+    int disp_hdrag_moved;
+    double disp_hdrag_x;
+    double disp_hdrag_scroll;
+    double profile_scroll;
+    int profile_drag;
+    int profile_drag_moved;
+    double profile_drag_y;
+    double profile_drag_scroll;
+    double appearance_scroll;
+    int appearance_drag;
+    int appearance_drag_moved;
+    double appearance_drag_y;
+    double appearance_drag_scroll;
+    double nav_scroll;
+    int nav_drag;
+    int nav_drag_moved;
+    double nav_drag_y;
+    double nav_drag_scroll;
     char toast[96];
     double toast_t;
     int pos_editor_open;
@@ -693,6 +741,36 @@ typedef struct {
 } Ui;
 
 static Ui g_ui;
+
+/* Shared by sidebar painting, hit-testing and scrolling. */
+static double nav_view_bottom(void)
+{
+    return WIN_H - NAV_BOTTOM_PAD;
+}
+
+static double nav_max_scroll(void)
+{
+    double view_h = nav_view_bottom() - NAV_TOP;
+    double total = PAGE_COUNT * NAV_PITCH;
+    return total > view_h ? total - view_h : 0.0;
+}
+
+static void nav_clamp_scroll(void)
+{
+    g_ui.nav_scroll = clampd(g_ui.nav_scroll, 0.0, nav_max_scroll());
+}
+
+static void nav_scroll_to_page(int page)
+{
+    double row_top = NAV_TOP + page * NAV_PITCH;
+    double view_top = NAV_TOP + g_ui.nav_scroll;
+    double view_bottom = nav_view_bottom() + g_ui.nav_scroll;
+    if (row_top < view_top)
+        g_ui.nav_scroll = row_top - NAV_TOP;
+    else if (row_top + NAV_BOX_H > view_bottom)
+        g_ui.nav_scroll = row_top + NAV_BOX_H - nav_view_bottom();
+    nav_clamp_scroll();
+}
 
 /* ------------------------------------------------------------------ */
 /*  Output management                                                  */
@@ -776,6 +854,9 @@ static void defaultapps_load(void);
 static void defaultapps_save(void);
 static void defaultapps_choose(int cat, int candidate);
 
+/* System facts shown on the About page. */
+static void sysfacts_init(void);
+
 /* Profile page / shared configuration. */
 static void profile_config_load(void);
 static void profile_save(void);
@@ -829,6 +910,14 @@ static void ui_clear_interaction(void)
     g_ui.app_picker_scroll = 0;
     g_ui.disp_drag = -1;
     g_ui.kb_drag = 0;
+    g_ui.kb_filter_drag = 0;
+    g_ui.startup_drag = 0;
+    g_ui.defapp_drag = 0;
+    g_ui.input_drag = 0;
+    g_ui.disp_hdrag = 0;
+    g_ui.profile_drag = 0;
+    g_ui.appearance_drag = 0;
+    g_ui.nav_drag = 0;
     if (g_zoom_open)
         zoom_cancel();
 }
@@ -839,6 +928,7 @@ static void ui_set_page(int page)
         return;
     ui_clear_interaction();
     g_ui.page = page;
+    nav_scroll_to_page(page);
 }
 
 static void ui_init(void)
@@ -870,15 +960,7 @@ static void ui_init(void)
     g_ui.toggles[TOG_DRAG] = 1;
     g_ui.toggles[TOG_DWT] = 1;
     g_ui.toggles[TOG_LEFT] = 0;
-    g_ui.toggles[TOG_RULE_PIP] = 1;
-    g_ui.toggles[TOG_RULE_TERM] = 1;
-    g_ui.toggles[TOG_RULE_WEB] = 0;
     g_ui.toggles[TOG_MIDDLE] = 0;
-    g_ui.toggles[TOG_IDLE_LOCK] = 1;
-    g_ui.toggles[TOG_DIM] = 1;
-    g_ui.toggles[TOG_LOCK_SUSPEND] = 1;
-    g_ui.toggles[TOG_RESTORE] = 1;
-    g_ui.toggles[TOG_LAST_WS] = 0;
     g_ui.toggles[TOG_PRIMARY_A] = 1;
     g_ui.toggles[TOG_PRIMARY_B] = 0;
     g_ui.toggles[TOG_BORDER_ANIM] = 1;
@@ -887,7 +969,6 @@ static void ui_init(void)
     g_ui.sliders[SL_REPEAT] = (45.0 - 15.0) / 65.0;
     g_ui.sliders[SL_DELAY] = (250.0 - 150.0) / 550.0;
     g_ui.sliders[SL_START_DELAY] = 0.0;
-    g_ui.sliders[SL_IDLE] = 0.45;
 
     g_ui.segments[SEG_SCROLL] = 0;
     g_ui.segments[SEG_KB_FILTER] = 0;
@@ -935,6 +1016,8 @@ static void ui_init(void)
     g_ui.segments[SEG_WX_UNITS] = g_profile_cfg.fahrenheit ? 1 : 0;
     if (g_profile_cfg.photo[0])
         profile_preview_load(g_profile_cfg.photo);
+
+    sysfacts_init();
 }
 
 /* ---- display helpers --------------------------------------------- */
@@ -1215,6 +1298,9 @@ static void displays_toggle_enabled(int idx)
 static int add_hit(int kind, int a, int b,
                    double x, double y, double w, double h)
 {
+    x += g_hit_dx;
+    y += g_hit_dy;
+
     /* Display cards scroll inside a clipped viewport.  Do not register
      * controls that are scrolled underneath the header or action row. */
     if (kind >= HIT_DISP_RES && kind <= HIT_DISP_MODE &&
@@ -1224,6 +1310,10 @@ static int add_hit(int kind, int a, int b,
 
     if (g_hit_clip_bottom > g_hit_clip_top &&
         (y < g_hit_clip_top || y + h > g_hit_clip_bottom))
+        return -1;
+
+    if (g_hit_clip_right > g_hit_clip_left &&
+        (x + w < g_hit_clip_left || x > g_hit_clip_right))
         return -1;
 
     if (g_hit_count >= MAX_HITS)
@@ -1622,9 +1712,6 @@ static const char *slider_text(int slider, double t, char *buf, size_t n)
     case SL_START_DELAY:
         snprintf(buf, n, "%.1f s", 20.0 * t);
         break;
-    case SL_IDLE:
-        snprintf(buf, n, "%.0f min", 1.0 + 59.0 * t);
-        break;
     default:
         snprintf(buf, n, "%.0f%%", t * 100.0);
         break;
@@ -1682,15 +1769,6 @@ static void paint_nav_icon(cairo_t *cr, int page, double x, double y,
         cairo_line_to(cr, x + 14.0, y + 10.0);
         cairo_stroke(cr);
         break;
-    case PAGE_RULES:
-        rounded_rect(cr, x + 1.0, y + 2.0, 16.0, 14.0, 2.5);
-        cairo_stroke(cr);
-        cairo_move_to(cr, x + 1.0, y + 6.5);
-        cairo_line_to(cr, x + 17.0, y + 6.5);
-        cairo_move_to(cr, x + 5.0, y + 10.0);
-        cairo_line_to(cr, x + 13.0, y + 10.0);
-        cairo_stroke(cr);
-        break;
     case PAGE_INPUT:
         rounded_rect(cr, x + 4.0, y + 1.5, 10.0, 15.0, 5.0);
         cairo_stroke(cr);
@@ -1719,15 +1797,6 @@ static void paint_nav_icon(cairo_t *cr, int page, double x, double y,
         cairo_fill(cr);
         cairo_move_to(cr, x + 5.0, y + 12.0);
         cairo_line_to(cr, x + 13.0, y + 12.0);
-        cairo_stroke(cr);
-        break;
-    case PAGE_SESSION:
-        /* power: a ring with a gap at the top and a stem into the centre */
-        cairo_arc(cr, cx, cy, 6.6, -PI / 2.0 + 0.55,
-                  3.0 * PI / 2.0 - 0.55);
-        cairo_stroke(cr);
-        cairo_move_to(cr, cx, cy - 7.4);
-        cairo_line_to(cr, cx, cy);
         cairo_stroke(cr);
         break;
     case PAGE_PROFILE:
@@ -1845,15 +1914,28 @@ static void paint_sidebar(cairo_t *cr, double now)
     text_draw(cr, "SETTINGS", 8.0, 600, C_DIM, 0.78,
               73.0, 44.0, ALIGN_LEFT, 2.4);
 
-    double y = 100.0;
+    nav_clamp_scroll();
+    double view_bottom = nav_view_bottom();
+    double view_h = view_bottom - NAV_TOP;
+
+    cairo_save(cr);
+    cairo_rectangle(cr, 0.0, NAV_TOP, SIDEBAR_W, view_h);
+    cairo_clip(cr);
+    g_hit_clip_top = NAV_TOP;
+    g_hit_clip_bottom = view_bottom;
+
     for (int i = 0; i < PAGE_COUNT; i++) {
-        int idx = add_hit(HIT_NAV, i, 0, 12.0, y, SIDEBAR_W - 24.0, 38.0);
+        double y = NAV_TOP + i * NAV_PITCH - g_ui.nav_scroll;
+        if (y + NAV_BOX_H < NAV_TOP || y > view_bottom)
+            continue;
+        int idx = add_hit(HIT_NAV, i, 0,
+                          12.0, y, SIDEBAR_W - 24.0, NAV_BOX_H);
         int active = g_ui.page == i;
         int hot = hit_hover(idx);
 
         if (active || hot) {
             rgba(cr, active ? C_ACCENT : C_FG, active ? 0.105 : 0.04);
-            rounded_rect(cr, 12.0, y, SIDEBAR_W - 24.0, 38.0, 8.0);
+            rounded_rect(cr, 12.0, y, SIDEBAR_W - 24.0, NAV_BOX_H, 8.0);
             cairo_fill(cr);
         }
         if (active) {
@@ -1875,7 +1957,28 @@ static void paint_sidebar(cairo_t *cr, double now)
             cairo_arc(cr, SIDEBAR_W - 28.0, y + 19.0, 2.0, 0.0, 2.0 * PI);
             cairo_fill(cr);
         }
-        y += 41.0;
+    }
+
+    g_hit_clip_top = -1.0;
+    g_hit_clip_bottom = -1.0;
+    cairo_restore(cr);
+
+    double max = nav_max_scroll();
+    if (max > 0.0) {
+        double track_h = view_h - 4.0;
+        double thumb_h = track_h * view_h / (PAGE_COUNT * NAV_PITCH);
+        if (thumb_h < 26.0)
+            thumb_h = 26.0;
+        double ty = NAV_TRACK_TOP +
+                    (track_h - thumb_h) * (g_ui.nav_scroll / max);
+        rgba(cr, C_TRACK, 0.85);
+        rounded_rect(cr, NAV_TRACK_X, NAV_TRACK_TOP, 4.0, track_h, 2.0);
+        cairo_fill(cr);
+        int thumb = add_hit(HIT_NAV_SCROLL, 0, 0,
+                            NAV_TRACK_X - 6.0, ty, 16.0, thumb_h);
+        rgba(cr, C_ACCENT, hit_hover(thumb) ? 0.95 : 0.55);
+        rounded_rect(cr, NAV_TRACK_X, ty, 4.0, thumb_h, 2.0);
+        cairo_fill(cr);
     }
 
     paint_divider(cr, 22.0, WIN_H - 128.0, SIDEBAR_W - 44.0);
@@ -2181,11 +2284,7 @@ static void paint_footer(cairo_t *cr)
         ? "BUILT-IN SHORTCUTS - Shortcuts cannot be altered!"
         : g_ui.page == PAGE_ABOUT
         ? "CLICK TO OPEN LINKS - Make sure default web browser is set!"
-        : (g_ui.page == PAGE_STARTUP || g_ui.page == PAGE_DEFAULT_APPS ||
-           g_ui.page == PAGE_DISPLAYS || g_ui.page == PAGE_INPUT ||
-           g_ui.page == PAGE_APPEARANCE || g_ui.page == PAGE_PROFILE)
-        ? "FEATURE IMPLEMENTED - Changes are saved!"
-        : "PREVIEW · changes are not saved!";
+        : "FEATURE IMPLEMENTED - Changes are saved!";
     unsigned col = C_FAINT;
     double alpha = 0.9;
 
@@ -2271,6 +2370,31 @@ static const char *const KB_FILTERS[] = {
 };
 #define KB_FILTER_COUNT ((int)(sizeof KB_FILTERS / sizeof KB_FILTERS[0]))
 
+/* Filter chips share the search row.  When the row is too narrow the chips
+ * scroll horizontally inside their own viewport instead of overlapping the
+ * search field.  These are refreshed by each paint, like the hit list. */
+#define KB_CHIP_Y        110.0
+#define KB_CHIP_H        22.0
+#define KB_CHIP_GAP      8.0
+#define KB_CHIP_MIN_VIEW 120.0
+#define KB_CHIP_TRACK_Y  142.0
+static double g_kb_filter_total;
+static double g_kb_filter_view_x;
+static double g_kb_filter_view_w;
+
+static double kb_filter_max_scroll(void)
+{
+    return g_kb_filter_total > g_kb_filter_view_w
+               ? g_kb_filter_total - g_kb_filter_view_w : 0.0;
+}
+
+static int kb_filter_row_at(double x, double y)
+{
+    return y >= KB_CHIP_Y - 6.0 && y <= KB_CHIP_TRACK_Y + 5.0 &&
+           x >= g_kb_filter_view_x &&
+           x <= g_kb_filter_view_x + g_kb_filter_view_w;
+}
+
 static int kb_filter_active(void)
 {
     int f = g_ui.segments[SEG_KB_FILTER];
@@ -2295,6 +2419,79 @@ static int kb_filtered_count(void)
 #define KB_ROW_H     43.0
 #define KB_HEADER_H  44.0
 #define KB_BOTTOM_GAP 62.0
+
+/* CONTEXT normally sits at a fixed offset in the card.  As the window gets
+ * narrower the right-aligned keycaps move left towards it, so slide the
+ * column left as well.  At the tightest sizes the action text also moves a
+ * few pixels closer to the row edge so all three columns still fit. */
+#define KB_CTX_OFFSET     330.0
+#define KB_CTX_GAP        8.0
+#define KB_CTX_GAP_TIGHT  6.0
+#define KB_ACTION_X       24.0
+#define KB_ACTION_X_TIGHT 16.0
+
+static double g_kb_cols_tw = -1.0;
+static int g_kb_cols_filter = -1;
+static double g_kb_cols_action_x;
+static double g_kb_cols_ctx_x;
+
+static void kb_columns(cairo_t *cr, double tw,
+                       double *action_x, double *ctx_x)
+{
+    int filter = kb_filter_active();
+    if (tw != g_kb_cols_tw || filter != g_kb_cols_filter) {
+        double tx = CONTENT_X;
+        double right = tx + tw - 20.0;
+        double upper = right;
+        double lower = 0.0;
+        double max_cw = 0.0;
+        double ax = tx + KB_ACTION_X;
+        double cx;
+
+        for (int i = 0; i < KEYBIND_COUNT; i++) {
+            if (!kb_row_matches(i))
+                continue;
+            double cw = text_width(cr, KEYBINDS[i].context, 9.0, 400, 0.3);
+            double aw = text_width(cr, KEYBINDS[i].action, 11.5, 600, 0.1);
+            double kw = 0.0;
+            for (int k = 0; k < KEYBINDS[i].nkeys; k++) {
+                kw += keycap_width(cr, KEYBINDS[i].keys[k]);
+                if (k < KEYBINDS[i].nkeys - 1) kw += 5.0;
+            }
+            double limit = right - kw - cw - KB_CTX_GAP;
+            if (limit < upper)
+                upper = limit;
+            double end = ax + aw + KB_CTX_GAP;
+            if (end > lower)
+                lower = end;
+            if (cw > max_cw)
+                max_cw = cw;
+        }
+        if (upper > right - max_cw - KB_CTX_GAP)
+            upper = right - max_cw - KB_CTX_GAP;
+
+        cx = fmin(tx + KB_CTX_OFFSET, upper);
+        if (cx < lower) {
+            /* No room at the normal padding: pull the action text left. */
+            ax = tx + KB_ACTION_X_TIGHT;
+            for (int i = 0; i < KEYBIND_COUNT; i++) {
+                if (!kb_row_matches(i))
+                    continue;
+                double aw = text_width(cr, KEYBINDS[i].action,
+                                       11.5, 600, 0.1);
+                double end = ax + aw + KB_CTX_GAP_TIGHT;
+                if (end > cx)
+                    cx = end;
+            }
+        }
+        g_kb_cols_action_x = ax;
+        g_kb_cols_ctx_x = cx;
+        g_kb_cols_tw = tw;
+        g_kb_cols_filter = filter;
+    }
+    *action_x = g_kb_cols_action_x;
+    *ctx_x = g_kb_cols_ctx_x;
+}
 
 static void kb_geom(double *ty, double *th, double *view_h)
 {
@@ -2327,7 +2524,27 @@ static void paint_search_icon(cairo_t *cr, double x, double y)
 
 static void page_keybindings(cairo_t *cr)
 {
-    double fx = CONTENT_X, fy = 104.0, fw = 380.0, fh = 34.0;
+    double fx = CONTENT_X, fy = 104.0, fh = 34.0;
+    double total = 0.0;
+    for (int i = 0; i < KB_FILTER_COUNT; i++) {
+        total += chip_width(cr, KB_FILTERS[i]);
+        if (i < KB_FILTER_COUNT - 1) total += KB_CHIP_GAP;
+    }
+    g_kb_filter_total = total;
+
+    /* Keep a usable search field and give the chips their own viewport. */
+    double fw = 380.0;
+    if (CONTENT_W - fw - 16.0 < KB_CHIP_MIN_VIEW)
+        fw = CONTENT_W - 16.0 - KB_CHIP_MIN_VIEW;
+    if (fw < 140.0)
+        fw = 140.0;
+    double vx = fx + fw + 16.0;
+    double vw = WIN_W - 36.0 - vx;
+    if (vw < 40.0)
+        vw = 40.0;
+    g_kb_filter_view_x = vx;
+    g_kb_filter_view_w = vw;
+
     rgba(cr, C_TRACK, 0.9);
     rounded_rect(cr, fx, fy, fw, fh, 7.0);
     cairo_fill(cr);
@@ -2339,18 +2556,41 @@ static void page_keybindings(cairo_t *cr)
     text_draw(cr, "Search shortcuts…", 10.5, 500, C_DIM, 0.72,
               fx + 32.0, fy + 10.0, ALIGN_LEFT, 0.1);
 
-    double total = 0.0;
-    for (int i = 0; i < KB_FILTER_COUNT; i++) {
-        total += chip_width(cr, KB_FILTERS[i]);
-        if (i < KB_FILTER_COUNT - 1) total += 8.0;
-    }
-    double cx = WIN_W - 36.0 - total;
+    double fmax_scroll = kb_filter_max_scroll();
+    g_ui.kb_filter_scroll = clampd(g_ui.kb_filter_scroll, 0.0, fmax_scroll);
+    double cx = vx - g_ui.kb_filter_scroll;
+    if (fmax_scroll <= 0.0)
+        cx += vw - total;
     int active_filter = kb_filter_active();
+
+    cairo_save(cr);
+    cairo_rectangle(cr, vx, KB_CHIP_Y - 3.0, vw, KB_CHIP_H + 6.0);
+    cairo_clip(cr);
     for (int i = 0; i < KB_FILTER_COUNT; i++) {
         double w = chip_width(cr, KB_FILTERS[i]);
-        (void)add_hit(HIT_SEGMENT, SEG_KB_FILTER, i, cx, 110.0, w, 22.0);
-        paint_chip(cr, KB_FILTERS[i], cx, 110.0, i == active_filter);
-        cx += w + 8.0;
+        if (cx >= vx && cx + w <= vx + vw)
+            (void)add_hit(HIT_SEGMENT, SEG_KB_FILTER, i,
+                          cx, KB_CHIP_Y, w, KB_CHIP_H);
+        paint_chip(cr, KB_FILTERS[i], cx, KB_CHIP_Y, i == active_filter);
+        cx += w + KB_CHIP_GAP;
+    }
+    cairo_restore(cr);
+
+    if (fmax_scroll > 0.0) {
+        double thumb_w = vw * vw / total;
+        if (thumb_w < 28.0)
+            thumb_w = 28.0;
+        double thumb_x = vx + (vw - thumb_w) *
+                         (g_ui.kb_filter_scroll / fmax_scroll);
+        rgba(cr, C_FG, 0.05);
+        rounded_rect(cr, vx, KB_CHIP_TRACK_Y, vw, 3.0, 1.5);
+        cairo_fill(cr);
+        (void)add_hit(HIT_KB_FILTER_SCROLL, 0, 0,
+                      thumb_x - 2.0, KB_CHIP_TRACK_Y - 4.0,
+                      thumb_w + 4.0, 11.0);
+        rgba(cr, C_FG, 0.20);
+        rounded_rect(cr, thumb_x, KB_CHIP_TRACK_Y, thumb_w, 3.0, 1.5);
+        cairo_fill(cr);
     }
 
     double tx = CONTENT_X, ty, th, view_h;
@@ -2360,12 +2600,15 @@ static void page_keybindings(cairo_t *cr)
     g_ui.kb_scroll = clampd(g_ui.kb_scroll, 0.0, max_scroll);
     double scroll = g_ui.kb_scroll;
 
+    double action_x, ctx_x;
+    kb_columns(cr, tw, &action_x, &ctx_x);
+
     paint_card(cr, tx, ty, tw, th);
 
     text_draw(cr, "ACTION", 8.0, 600, C_FAINT, 0.9,
-              tx + 20.0, ty + 14.0, ALIGN_LEFT, 1.4);
+              action_x - 4.0, ty + 14.0, ALIGN_LEFT, 1.4);
     text_draw(cr, "CONTEXT", 8.0, 600, C_FAINT, 0.9,
-              tx + 330.0, ty + 14.0, ALIGN_LEFT, 1.4);
+              ctx_x, ty + 14.0, ALIGN_LEFT, 1.4);
     text_draw(cr, "SHORTCUT", 8.0, 600, C_FAINT, 0.9,
               tx + tw - 20.0, ty + 14.0, ALIGN_RIGHT, 1.4);
     paint_divider(cr, tx + 20.0, ty + 36.0, tw - 40.0);
@@ -2408,9 +2651,9 @@ static void page_keybindings(cairo_t *cr)
 
         text_draw(cr, KEYBINDS[i].action, 11.5, sel ? 600 : 500,
                   sel ? C_FG : (hot ? 0xECECEC : 0xD2D2D2), 0.96,
-                  tx + 24.0, ry + 12.0, ALIGN_LEFT, 0.1);
+                  action_x, ry + 12.0, ALIGN_LEFT, 0.1);
         text_draw(cr, KEYBINDS[i].context, 9.0, 400, C_DIM, 0.72,
-                  tx + 330.0, ry + 14.0, ALIGN_LEFT, 0.3);
+                  ctx_x, ry + 14.0, ALIGN_LEFT, 0.3);
 
         double kw = 0.0;
         for (int k = 0; k < KEYBINDS[i].nkeys; k++) {
@@ -2428,7 +2671,7 @@ static void page_keybindings(cairo_t *cr)
     cairo_restore(cr);
 
     if (max_scroll > 0.0) {
-        double track_x = tx + tw - 7.0;
+        double track_x = tx + tw + 8.0;
         double track_y = list_top + 4.0;
         double track_h = view_h - 8.0;
         double total_h = visible_count * KB_ROW_H;
@@ -4275,10 +4518,27 @@ static void paint_mini_toggle_ex(cairo_t *cr, double x, double y,
 }
 
 
-static void paint_mini_toggle(cairo_t *cr, double x, double y,
-                              int on, int toggle_id)
+#define STARTUP_LIST_TOP   (142.0 + 42.0)
+#define STARTUP_ROW_H      44.0
+
+static void startup_geom(double *top, double *bottom, double *view_h)
 {
-    paint_switch(cr, x, y, on, HIT_TOGGLE, toggle_id);
+    double ty = 142.0;
+    double by = WIN_H - 122.0;
+    double th = (by - 12.0) - ty;
+    double ay = ty + th - 40.0;
+
+    *top = STARTUP_LIST_TOP;
+    *bottom = ay - 8.0;
+    *view_h = *bottom > *top ? *bottom - *top : 0.0;
+}
+
+static double startup_max_scroll(void)
+{
+    double top, bottom, view_h;
+    startup_geom(&top, &bottom, &view_h);
+    double total = g_startup_count * STARTUP_ROW_H;
+    return total > view_h ? total - view_h : 0.0;
 }
 
 static void page_startup(cairo_t *cr)
@@ -4308,8 +4568,21 @@ static void page_startup(cairo_t *cr)
                   ALIGN_CENTER, 0.1);
     }
 
+    double list_top, list_bottom, view_h;
+    startup_geom(&list_top, &list_bottom, &view_h);
+    double smax = startup_max_scroll();
+    g_ui.startup_scroll = clampd(g_ui.startup_scroll, 0.0, smax);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, tx, list_top, tw, view_h);
+    cairo_clip(cr);
+    g_hit_clip_top = list_top;
+    g_hit_clip_bottom = list_bottom;
+
     for (int i = 0; i < g_startup_count; i++) {
-        double ry = ty + 42.0 + i * 44.0;
+        double ry = list_top + i * STARTUP_ROW_H - g_ui.startup_scroll;
+        if (ry + STARTUP_ROW_H < list_top || ry > list_bottom)
+            continue;
         char name[64];
         startup_name(g_startups[i].command, name, sizeof name);
 
@@ -4328,6 +4601,30 @@ static void page_startup(cairo_t *cr)
 
         if (i < g_startup_count - 1)
             paint_divider(cr, tx + 20.0, ry + 43.0, tw - 40.0);
+    }
+
+    g_hit_clip_top = -1.0;
+    g_hit_clip_bottom = -1.0;
+    cairo_restore(cr);
+
+    if (smax > 0.0) {
+        double track_x = tx + tw + 8.0;
+        double track_y = list_top + 4.0;
+        double track_h = view_h - 8.0;
+        double total_h = g_startup_count * STARTUP_ROW_H;
+        double thumb_h = track_h * (view_h / total_h);
+        if (thumb_h < 28.0)
+            thumb_h = 28.0;
+        double thumb_y = track_y +
+                         (track_h - thumb_h) * (g_ui.startup_scroll / smax);
+        rgba(cr, C_FG, 0.05);
+        rounded_rect(cr, track_x, track_y, 3.0, track_h, 1.5);
+        cairo_fill(cr);
+        (void)add_hit(HIT_STARTUP_SCROLL, 0, 0,
+                      track_x - 4.0, thumb_y, 11.0, thumb_h);
+        rgba(cr, C_FG, 0.20);
+        rounded_rect(cr, track_x, thumb_y, 3.0, thumb_h, 1.5);
+        cairo_fill(cr);
     }
 
     double ay = ty + th - 40.0;
@@ -4395,22 +4692,59 @@ static void page_startup(cairo_t *cr)
 /*  Page: Default Apps                                                 */
 /* ------------------------------------------------------------------ */
 
+#define DEFAPP_TOP    152.0
+#define DEFAPP_ROW_H  58.0
+#define DEFAPP_GAP    6.0
+#define DEFAPP_NOTE_Y (WIN_H - 54.0)
+
+static void defapp_geom(double *top, double *bottom, double *view_h)
+{
+    double last_bottom = DEFAPP_TOP +
+        (APP_CAT_COUNT - 1) * (DEFAPP_ROW_H + DEFAPP_GAP) + DEFAPP_ROW_H;
+    double limit = DEFAPP_NOTE_Y - 8.0;
+
+    *top = DEFAPP_TOP;
+    *bottom = limit < last_bottom ? limit : last_bottom;
+    *view_h = *bottom > *top ? *bottom - *top : 0.0;
+}
+
+static double defapp_max_scroll(void)
+{
+    double top, bottom, view_h;
+    defapp_geom(&top, &bottom, &view_h);
+    (void)top;
+    (void)bottom;
+    double total = APP_CAT_COUNT * DEFAPP_ROW_H +
+                   (APP_CAT_COUNT - 1) * DEFAPP_GAP;
+    return total > view_h ? total - view_h : 0.0;
+}
+
 static void page_defaultapps(cairo_t *cr)
 {
     section_label(cr, "DEFAULT APPS", CONTENT_X, 102.0);
     text_draw(cr, "Choose the applications jtlab and your desktop open by default",
               9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
 
-    /* Match the Keybindings page: leave breathing room under the header. */
-    double y = 152.0;
-    double row_h = 58.0;
-    double gap = 6.0;
     double field_w = 292.0;
     double field_x = CONTENT_X + CONTENT_W - field_w - 20.0;
 
+    double list_top, list_bottom, view_h;
+    defapp_geom(&list_top, &list_bottom, &view_h);
+    double smax = defapp_max_scroll();
+    g_ui.defapp_scroll = clampd(g_ui.defapp_scroll, 0.0, smax);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, CONTENT_X, list_top, CONTENT_W, view_h);
+    cairo_clip(cr);
+    g_hit_clip_top = list_top;
+    g_hit_clip_bottom = list_bottom;
+
     for (int i = 0; i < APP_CAT_COUNT; i++) {
-        double ry = y + i * (row_h + gap);
-        paint_card(cr, CONTENT_X, ry, CONTENT_W, row_h);
+        double ry = list_top + i * (DEFAPP_ROW_H + DEFAPP_GAP) -
+                    g_ui.defapp_scroll;
+        if (ry + DEFAPP_ROW_H < list_top || ry > list_bottom)
+            continue;
+        paint_card(cr, CONTENT_X, ry, CONTENT_W, DEFAPP_ROW_H);
 
         text_draw(cr, APP_CATEGORIES[i].label, 12.0, 600, C_FG, 0.96,
                   CONTENT_X + 20.0, ry + 12.0, ALIGN_LEFT, 0.1);
@@ -4464,135 +4798,97 @@ static void page_defaultapps(cairo_t *cr)
         cairo_stroke(cr);
     }
 
+    g_hit_clip_top = -1.0;
+    g_hit_clip_bottom = -1.0;
+    cairo_restore(cr);
+
+    if (smax > 0.0) {
+        double track_x = CONTENT_X + CONTENT_W + 8.0;
+        double track_y = list_top + 4.0;
+        double track_h = view_h - 8.0;
+        double total_h = APP_CAT_COUNT * DEFAPP_ROW_H +
+                         (APP_CAT_COUNT - 1) * DEFAPP_GAP;
+        double thumb_h = track_h * (view_h / total_h);
+        if (thumb_h < 28.0)
+            thumb_h = 28.0;
+        double thumb_y = track_y +
+                         (track_h - thumb_h) * (g_ui.defapp_scroll / smax);
+        rgba(cr, C_FG, 0.05);
+        rounded_rect(cr, track_x, track_y, 3.0, track_h, 1.5);
+        cairo_fill(cr);
+        (void)add_hit(HIT_DEFAPP_SCROLL, 0, 0,
+                      track_x - 4.0, thumb_y, 11.0, thumb_h);
+        rgba(cr, C_FG, 0.20);
+        rounded_rect(cr, track_x, thumb_y, 3.0, thumb_h, 1.5);
+        cairo_fill(cr);
+    }
+
     text_wrap(cr,
         "Defaults are applied through XDG and stored in "
         "~/.config/jt/defaultapps.conf. The terminal is also written to "
         "keybinds.conf for Super + Return.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X,
-        y + (APP_CAT_COUNT - 1) * (row_h + gap) + row_h + 8.0,
-        CONTENT_W, 2);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Page: Window Rules                                                 */
-/* ------------------------------------------------------------------ */
-
-typedef struct {
-    const char *name;
-    const char *desc;
-    const char *match[2];
-    int n_match;
-    const char *action[2];
-    int n_action;
-    int toggle;
-} RuleRow;
-
-static const RuleRow RULES[] = {
-    { "Picture-in-Picture",
-      "Keep small video previews above everything else, without stealing "
-      "keyboard focus.",
-      { "app_id = firefox", "title ~ Picture-in-Picture" }, 2,
-      { "Always on top" }, 1, TOG_RULE_PIP },
-    { "Terminal",
-      "Give foot a comfortable starting size and hide the server-side "
-      "decorations.",
-      { "app_id = foot", "role = toplevel" }, 2,
-      { "960 × 620", "No decorations" }, 2, TOG_RULE_TERM },
-    { "Browser",
-      "Place Firefox on the second workspace and open it maximised.",
-      { "app_id = firefox" }, 1,
-      { "Workspace 2", "Maximise" }, 2, TOG_RULE_WEB },
-};
-#define RULE_COUNT ((int)(sizeof RULES / sizeof RULES[0]))
-
-static void page_rules(cairo_t *cr)
-{
-    section_label(cr, "WINDOW RULES", CONTENT_X, 102.0);
-    text_draw(cr, "Rules are matched top to bottom; the first match wins",
-              9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
-
-    double btn_y = WIN_H - 180.0;
-    double card_h = 116.0;
-    double gap = 14.0 + (WIN_H - DESIGN_H) / (RULE_COUNT - 1);
-    if (gap < 14.0)
-        gap = 14.0;
-
-    for (int i = 0; i < RULE_COUNT; i++) {
-        double ry = 142.0 + i * (card_h + gap);
-        int idx = add_hit(HIT_ROW, i, 0, CONTENT_X, ry, CONTENT_W, card_h);
-        int sel = g_ui.selected[PAGE_RULES] == i;
-        int hot = hit_hover(idx);
-
-        paint_card(cr, CONTENT_X, ry, CONTENT_W, card_h);
-        if (sel) {
-            rgba(cr, C_ACCENT, 0.55);
-            cairo_set_line_width(cr, 1.2);
-            rounded_rect(cr, CONTENT_X + 0.6, ry + 0.6, CONTENT_W - 1.2,
-                         card_h - 1.2, 9.4);
-            cairo_stroke(cr);
-        } else if (hot) {
-            rgba(cr, C_FG, 0.20);
-            cairo_set_line_width(cr, 1.0);
-            rounded_rect(cr, CONTENT_X + 0.5, ry + 0.5, CONTENT_W - 1.0,
-                         card_h - 1.0, 9.5);
-            cairo_stroke(cr);
-        }
-
-        rgba(cr, C_ACCENT, sel ? 0.9 : 0.55);
-        rounded_rect(cr, CONTENT_X, ry + 20.0, 3.0, 76.0, 1.5);
-        cairo_fill(cr);
-
-        text_draw(cr, RULES[i].name, 13.0, 600, C_FG, 0.96,
-                  CONTENT_X + 20.0, ry + 16.0, ALIGN_LEFT, 0.1);
-        text_wrap(cr, RULES[i].desc, 9.2, 400, C_DIM, 0.78,
-                  CONTENT_X + 20.0, ry + 36.0, 520.0, 2);
-
-        double mx = CONTENT_X + 20.0;
-        for (int k = 0; k < RULES[i].n_match; k++)
-            mx += paint_chip(cr, RULES[i].match[k], mx, ry + 74.0, 0) + 7.0;
-
-        double ax = CONTENT_X + CONTENT_W - 20.0;
-        for (int k = RULES[i].n_action - 1; k >= 0; k--) {
-            double w = chip_width(cr, RULES[i].action[k]);
-            ax -= w;
-            paint_chip(cr, RULES[i].action[k], ax, ry + 74.0, 1);
-            ax -= 7.0;
-        }
-
-        paint_mini_toggle(cr, CONTENT_X + CONTENT_W - 62.0, ry + 16.0,
-                          g_ui.toggles[RULES[i].toggle], RULES[i].toggle);
-    }
-
-    paint_dashed_button(cr, CONTENT_X, btn_y, CONTENT_W, 52.0,
-                        "New window rule", BTN_NEW_RULE);
-
-    text_wrap(cr,
-        "A finished app would read and write these rules in "
-        "~/.config/labwc/rc.xml, then ask jtlabwc to reload. The preview "
-        "keeps everything local.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, WIN_H - 108.0, CONTENT_W, 2);
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, DEFAPP_NOTE_Y, CONTENT_W, 2);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Page: Input                                                        */
 /* ------------------------------------------------------------------ */
 
+#define INPUT_TOP       102.0
+#define INPUT_POINTER_H 306.0
+#define INPUT_KB_H      292.0
+#define INPUT_OPTIONS_H 160.0
+#define INPUT_NOTE_Y    (WIN_H - 56.0)
+#define INPUT_HEADER_GAP 20.0
+#define INPUT_KB_GAP     40.0
+
+static void input_geom(double *top, double *bottom, double *view_h)
+{
+    *top = INPUT_TOP;
+    *bottom = INPUT_NOTE_Y - 12.0;
+    *view_h = *bottom > *top ? *bottom - *top : 0.0;
+}
+
+static double input_content_bottom(void)
+{
+    double card_top = INPUT_TOP + INPUT_HEADER_GAP;
+    double kb_y = card_top + INPUT_POINTER_H + INPUT_KB_GAP;
+    double opt_y = kb_y + INPUT_KB_H + 16.0;
+    return opt_y + INPUT_OPTIONS_H;
+}
+
+static double input_max_scroll(void)
+{
+    double top, bottom, view_h;
+    input_geom(&top, &bottom, &view_h);
+    double content = input_content_bottom();
+    return content > bottom ? content - bottom : 0.0;
+}
+
 static void page_input(cairo_t *cr)
 {
-    double col_w = (CONTENT_W - 20.0) / 2.0;
-    double col2 = CONTENT_X + col_w + 20.0;
-    double inner = col_w - 36.0;
+    double inner = CONTENT_W - 36.0;
 
-    section_label(cr, "POINTER & TOUCHPAD", CONTENT_X, 102.0);
-    section_label(cr, "KEYBOARD", col2, 102.0);
+    double top, bottom, view_h;
+    input_geom(&top, &bottom, &view_h);
+    double smax = input_max_scroll();
+    g_ui.input_scroll = clampd(g_ui.input_scroll, 0.0, smax);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, CONTENT_X, top, CONTENT_W, view_h);
+    cairo_clip(cr);
+    g_hit_clip_top = top;
+    g_hit_clip_bottom = bottom;
 
     char v[32];
-    double cy = 122.0;
-    double gy = WIN_H - 278.0;
-    double ch = gy - 20.0 - cy;
+    double base = top - g_ui.input_scroll;
+    double cy = base + INPUT_HEADER_GAP;
+    double kb_y = cy + INPUT_POINTER_H + INPUT_KB_GAP;
+    double gy = kb_y + INPUT_KB_H + 16.0;
 
-    paint_card(cr, CONTENT_X, cy, col_w, ch);
-    paint_card(cr, col2, cy, col_w, ch);
+    section_label(cr, "POINTER & TOUCHPAD", CONTENT_X, base);
+
+    paint_card(cr, CONTENT_X, cy, CONTENT_W, INPUT_POINTER_H);
 
     double lx = CONTENT_X + 18.0;
     text_draw(cr, "Pointer", 12.0, 600, 0xE8E8E8, 0.95,
@@ -4620,40 +4916,42 @@ static void page_input(cairo_t *cr)
                      "Swap the primary mouse button",
                      g_ui.toggles[TOG_LEFT], TOG_LEFT);
 
-    double rx = col2 + 18.0;
+    section_label(cr, "KEYBOARD", CONTENT_X, kb_y - INPUT_HEADER_GAP);
+    paint_card(cr, CONTENT_X, kb_y, CONTENT_W, INPUT_KB_H);
+
+    double rx = CONTENT_X + 18.0;
     text_draw(cr, "Keyboard", 12.0, 600, 0xE8E8E8, 0.95,
-              rx, cy + 14.0, ALIGN_LEFT, 0.1);
+              rx, kb_y + 14.0, ALIGN_LEFT, 0.1);
 
     text_draw(cr, "Layout", 11.5, 500, 0xD2D2D2, 0.94,
-              rx, cy + 44.0, ALIGN_LEFT, 0.1);
-    paint_field(cr, rx, cy + 62.0, inner, 32.0,
+              rx, kb_y + 44.0, ALIGN_LEFT, 0.1);
+    paint_field(cr, rx, kb_y + 62.0, inner, 32.0,
                 "English (US) · intl", 0);
 
-    paint_slider_row(cr, rx, cy + 108.0, inner, "Repeat rate",
+    paint_slider_row(cr, rx, kb_y + 108.0, inner, "Repeat rate",
                      slider_text(SL_REPEAT, g_ui.sliders[SL_REPEAT],
                                  v, sizeof v),
                      g_ui.sliders[SL_REPEAT], SL_REPEAT);
-    paint_slider_row(cr, rx, cy + 156.0, inner, "Repeat delay",
+    paint_slider_row(cr, rx, kb_y + 156.0, inner, "Repeat delay",
                      slider_text(SL_DELAY, g_ui.sliders[SL_DELAY],
                                  v, sizeof v),
                      g_ui.sliders[SL_DELAY], SL_DELAY);
 
-    paint_divider(cr, rx, cy + 200.0, inner);
+    paint_divider(cr, rx, kb_y + 200.0, inner);
 
     text_draw(cr, "Compose key", 11.5, 500, 0xD2D2D2, 0.94,
-              rx, cy + 212.0, ALIGN_LEFT, 0.1);
-    paint_field(cr, rx, cy + 230.0, inner, 32.0, "Disabled", 0);
+              rx, kb_y + 212.0, ALIGN_LEFT, 0.1);
+    paint_field(cr, rx, kb_y + 230.0, inner, 32.0, "Disabled", 0);
     text_draw(cr, "Repeat settings apply to every keyboard", 8.5, 400,
-              C_FAINT, 0.8, rx, cy + 272.0, ALIGN_LEFT, 0.1);
+              C_FAINT, 0.8, rx, kb_y + 272.0, ALIGN_LEFT, 0.1);
 
-    paint_card(cr, CONTENT_X, gy, CONTENT_W, 104.0);
+    paint_card(cr, CONTENT_X, gy, CONTENT_W, INPUT_OPTIONS_H);
     text_draw(cr, "Pointer options", 12.0, 600, 0xE8E8E8, 0.95,
               CONTENT_X + 18.0, gy + 16.0, ALIGN_LEFT, 0.1);
 
-    double bw = (CONTENT_W - 36.0 - 40.0) / 3.0;
+    double bw = (CONTENT_W - 36.0 - 20.0) / 2.0;
     double bx1 = CONTENT_X + 18.0;
     double bx2 = bx1 + bw + 20.0;
-    double bx3 = bx2 + bw + 20.0;
 
     text_draw(cr, "Scroll method", 9.5, 500, C_DIM, 0.85,
               bx1, gy + 42.0, ALIGN_LEFT, 0.2);
@@ -4662,21 +4960,45 @@ static void page_input(cairo_t *cr)
                   scrolls, 3, g_ui.segments[SEG_SCROLL], SEG_SCROLL);
 
     text_draw(cr, "Acceleration", 9.5, 500, C_DIM, 0.85,
-              bx2, gy + 42.0, ALIGN_LEFT, 0.2);
+              bx1, gy + 100.0, ALIGN_LEFT, 0.2);
     static const char *const accels[] = { "Adaptive", "Flat" };
-    paint_segment(cr, bx2, gy + 58.0, bw, 30.0,
+    paint_segment(cr, bx1, gy + 116.0, bw, 30.0,
                   accels, 2, g_ui.segments[SEG_ACCEL], SEG_ACCEL);
 
-    paint_toggle_row(cr, bx3, gy + 24.0, bw,
+    paint_toggle_row(cr, bx2, gy + 24.0, bw,
                      "Middle click",
                      "Press both buttons",
                      g_ui.toggles[TOG_MIDDLE], TOG_MIDDLE);
+
+    g_hit_clip_top = -1.0;
+    g_hit_clip_bottom = -1.0;
+    cairo_restore(cr);
+
+    if (smax > 0.0) {
+        double track_x = CONTENT_X + CONTENT_W + 8.0;
+        double track_y = top + 4.0;
+        double track_h = view_h - 8.0;
+        double total_h = input_content_bottom() - top;
+        double thumb_h = track_h * (view_h / total_h);
+        if (thumb_h < 28.0)
+            thumb_h = 28.0;
+        double thumb_y = track_y +
+                         (track_h - thumb_h) * (g_ui.input_scroll / smax);
+        rgba(cr, C_FG, 0.05);
+        rounded_rect(cr, track_x, track_y, 3.0, track_h, 1.5);
+        cairo_fill(cr);
+        (void)add_hit(HIT_INPUT_SCROLL, 0, 0,
+                      track_x - 4.0, thumb_y, 11.0, thumb_h);
+        rgba(cr, C_FG, 0.20);
+        rounded_rect(cr, track_x, thumb_y, 3.0, thumb_h, 1.5);
+        cairo_fill(cr);
+    }
 
     text_wrap(cr,
         "Pointer, acceleration and keyboard repeat settings are saved to "
         "~/.config/jt/input.conf and applied by jtlabwc immediately. "
         "Layout and compose key are display-only for now.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, WIN_H - 156.0, CONTENT_W, 2);
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, INPUT_NOTE_Y, CONTENT_W, 2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4736,16 +5058,30 @@ static const char *head_description(const Head *h, char *buf, size_t n)
     return "Unknown display";
 }
 
-static void display_card(cairo_t *cr, int idx, double y)
+static double disp_hmax_scroll(void)
+{
+    return DISP_HCONTENT_W > CONTENT_W ? DISP_HCONTENT_W - CONTENT_W : 0.0;
+}
+
+static void disp_hclamp(void)
+{
+    double max = disp_hmax_scroll();
+    if (g_ui.disp_hscroll < 0.0)
+        g_ui.disp_hscroll = 0.0;
+    if (g_ui.disp_hscroll > max)
+        g_ui.disp_hscroll = max;
+}
+
+static void display_card(cairo_t *cr, int idx, double y, double sx)
 {
     Head *h = &g_heads[idx];
     int connected = h->p_enabled;
 
     paint_card(cr, CONTENT_X, y, CONTENT_W, 206.0);
-    paint_display_preview(cr, CONTENT_X + 18.0, y + 18.0, 196.0, 140.0,
+    paint_display_preview(cr, CONTENT_X + 18.0 + sx, y + 18.0, 196.0, 140.0,
                           connected);
 
-    double rx = CONTENT_X + 240.0;
+    double rx = CONTENT_X + 240.0 + sx;
     char descbuf[192];
     const char *desc = head_description(h, descbuf, sizeof descbuf);
 
@@ -4835,7 +5171,8 @@ static void display_card(cairo_t *cr, int idx, double y)
         snprintf(status, sizeof status, "Disabled");
     }
     text_wrap(cr, status, 8.5, 400, connected ? C_GREEN : C_FAINT,
-              connected ? 0.8 : 0.7, CONTENT_X + 18.0, y + 172.0, 196.0, 1);
+              connected ? 0.8 : 0.7, CONTENT_X + 18.0 + sx, y + 172.0,
+              196.0, 1);
 }
 
 static void page_displays(cairo_t *cr)
@@ -4854,6 +5191,7 @@ static void page_displays(cairo_t *cr)
         g_ui.disp_scroll = max_scroll;
     if (g_ui.disp_scroll < 0)
         g_ui.disp_scroll = 0;
+    disp_hclamp();
 
     char summary[96];
     if (n > 0)
@@ -4884,6 +5222,10 @@ static void page_displays(cairo_t *cr)
         cairo_rectangle(cr, CONTENT_X, view_top, CONTENT_W,
                             view_bottom - view_top);
         cairo_clip(cr);
+        double sx = -g_ui.disp_hscroll;
+        g_hit_dx = sx;
+        g_hit_clip_left = CONTENT_X;
+        g_hit_clip_right = CONTENT_X + CONTENT_W;
 
         int ord = 0;
         for (int i = 0; i < MAX_HEADS; i++) {
@@ -4893,10 +5235,32 @@ static void page_displays(cairo_t *cr)
             ord++;
             if (y + 206.0 < view_top || y > view_bottom)
                 continue;
-            display_card(cr, i, y);
+            display_card(cr, i, y, sx);
         }
 
+        g_hit_dx = 0.0;
+        g_hit_clip_left = -1.0;
+        g_hit_clip_right = -1.0;
         cairo_restore(cr);
+    }
+
+    double hmax = disp_hmax_scroll();
+    if (hmax > 0.0) {
+        double track_x = CONTENT_X;
+        double track_y = DISP_HSCROLL_Y;
+        double thumb_w = CONTENT_W * (CONTENT_W / DISP_HCONTENT_W);
+        if (thumb_w < 28.0)
+            thumb_w = 28.0;
+        double thumb_x = track_x +
+                         (CONTENT_W - thumb_w) * (g_ui.disp_hscroll / hmax);
+        rgba(cr, C_FG, 0.05);
+        rounded_rect(cr, track_x, track_y, CONTENT_W, 3.0, 1.5);
+        cairo_fill(cr);
+        (void)add_hit(HIT_DISP_HSCROLL, 0, 0,
+                      thumb_x, track_y - 4.0, thumb_w, 11.0);
+        rgba(cr, C_FG, 0.20);
+        rounded_rect(cr, thumb_x, track_y, thumb_w, 3.0, 1.5);
+        cairo_fill(cr);
     }
 
     paint_button(cr, CONTENT_X, btn_y, 140.0, 36.0,
@@ -4917,8 +5281,45 @@ static void page_displays(cairo_t *cr)
 /*  Page: Appearance                                                    */
 /* ------------------------------------------------------------------ */
 
+#define APPEARANCE_TOP           102.0
+#define APPEARANCE_CONTENT_BOTTOM 310.0
+#define APPEARANCE_VIEW_BOTTOM   (WIN_H - 12.0)
+
+static void appearance_geom(double *top, double *bottom, double *view_h)
+{
+    *top = APPEARANCE_TOP;
+    *bottom = APPEARANCE_VIEW_BOTTOM;
+    *view_h = *bottom > *top ? *bottom - *top : 0.0;
+}
+
+static double appearance_max_scroll(void)
+{
+    double top, bottom, view_h;
+    appearance_geom(&top, &bottom, &view_h);
+    (void)top;
+    (void)view_h;
+    return APPEARANCE_CONTENT_BOTTOM > bottom
+               ? APPEARANCE_CONTENT_BOTTOM - bottom : 0.0;
+}
+
 static void page_appearance(cairo_t *cr)
 {
+    double top, bottom, view_h;
+    appearance_geom(&top, &bottom, &view_h);
+    double smax = appearance_max_scroll();
+    if (g_ui.appearance_scroll > smax)
+        g_ui.appearance_scroll = smax;
+    if (g_ui.appearance_scroll < 0.0)
+        g_ui.appearance_scroll = 0.0;
+
+    cairo_save(cr);
+    cairo_rectangle(cr, CONTENT_X, top, CONTENT_W, view_h);
+    cairo_clip(cr);
+    cairo_translate(cr, 0.0, -g_ui.appearance_scroll);
+    g_hit_dy = -g_ui.appearance_scroll;
+    g_hit_clip_top = top;
+    g_hit_clip_bottom = bottom;
+
     double inner = CONTENT_W - 36.0;
     double lx = CONTENT_X + 18.0;
 
@@ -4937,151 +5338,37 @@ static void page_appearance(cairo_t *cr)
     text_draw(cr, "Saved to ~/.config/jt/appearance.conf", 8.8, 400,
               C_DIM, 0.8, lx, cy + 106.0, ALIGN_LEFT, 0.1);
 
-    section_label(cr, "PREVIEW", CONTENT_X, cy + ch + 30.0);
-
-    /* Leave a real gap under the PREVIEW label instead of butting the card
-     * right up against the text. */
-    double py = cy + ch + 50.0;
-    paint_card(cr, CONTENT_X, py, CONTENT_W, 116.0);
-
-    text_draw(cr, "Accent", 11.0, 500, C_DIM, 0.85,
-              lx, py + 20.0, ALIGN_LEFT, 0.1);
-    rgba(cr, C_ACCENT, 1.0);
-    rounded_rect(cr, lx + 50.0, py + 10.0, 18.0, 18.0, 5.0);
-    cairo_fill(cr);
-    char hex[16];
-    snprintf(hex, sizeof hex, "#%06X", C_ACCENT);
-    text_draw(cr, hex, 11.0, 600, 0xE0E0E0, 0.95,
-              lx + 76.0, py + 21.0, ALIGN_LEFT, 0.1);
-
-    text_draw(cr, "Interface font", 11.0, 500, C_DIM, 0.85,
-              lx, py + 56.0, ALIGN_LEFT, 0.1);
-    text_draw(cr, FONT_FAMILY, 11.0, 600, 0xE0E0E0, 0.95,
-              lx + 92.0, py + 56.0, ALIGN_LEFT, 0.1);
-
-    text_draw(cr, "Frame radius comes from jtlabwc's theme.", 8.8, 400,
-              C_FAINT, 0.8, lx, py + 86.0, ALIGN_LEFT, 0.1);
-
     text_wrap(cr,
         "The border switch is applied by jtlabwc immediately. Accent colours "
         "come from JTLab and its live control socket.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, py + 132.0, CONTENT_W, 2);
-}
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, cy + ch + 20.0, CONTENT_W, 2);
 
+    g_hit_dy = 0.0;
+    g_hit_clip_top = -1.0;
+    g_hit_clip_bottom = -1.0;
+    cairo_restore(cr);
 
-/*  Page: Session                                                      */
-/* ------------------------------------------------------------------ */
-
-static void page_session(cairo_t *cr)
-{
-    double col_w = (CONTENT_W - 20.0) / 2.0;
-    double col2 = CONTENT_X + col_w + 20.0;
-    double inner = col_w - 36.0;
-    double row_w = col_w - 20.0;
-
-    section_label(cr, "IDLE & LOCK", CONTENT_X, 102.0);
-    section_label(cr, "POWER COMMANDS", col2, 102.0);
-
-    char v[32];
-    double cy = 122.0;
-    double by = WIN_H - 344.0;
-    double ch = by - 22.0 - cy;
-
-    paint_card(cr, CONTENT_X, cy, col_w, ch);
-    double lx = CONTENT_X + 18.0;
-    text_draw(cr, "Away from the keyboard", 12.0, 600, 0xE8E8E8, 0.95,
-              lx, cy + 14.0, ALIGN_LEFT, 0.1);
-
-    paint_slider_row(cr, lx, cy + 44.0, inner, "Idle timeout",
-                     slider_text(SL_IDLE, g_ui.sliders[SL_IDLE], v, sizeof v),
-                     g_ui.sliders[SL_IDLE], SL_IDLE);
-    paint_divider(cr, lx, cy + 88.0, inner);
-
-    paint_toggle_row(cr, lx, cy + 98.0, inner, "Lock when idle",
-                     "Require a password after the timeout",
-                     g_ui.toggles[TOG_IDLE_LOCK], TOG_IDLE_LOCK);
-    paint_toggle_row(cr, lx, cy + 140.0, inner, "Dim before locking",
-                     "Fade the screen one minute early",
-                     g_ui.toggles[TOG_DIM], TOG_DIM);
-    paint_toggle_row(cr, lx, cy + 182.0, inner, "Lock on suspend",
-                     "Never wake straight into the desktop",
-                     g_ui.toggles[TOG_LOCK_SUSPEND], TOG_LOCK_SUSPEND);
-
-    paint_card(cr, col2, cy, col_w, ch);
-    text_draw(cr, "End the session", 12.0, 600, 0xE8E8E8, 0.95,
-              col2 + 18.0, cy + 14.0, ALIGN_LEFT, 0.1);
-
-    static const struct {
-        const char *label;
-        const char *desc;
-        const char *key1;
-        const char *key2;
-        int button;
-    } commands[] = {
-        { "Lock screen", "jtlockscreen", "Super", "L", BTN_LOGOUT },
-        { "Log out", "End the jtlabwc session", "Super", "Shift+E", BTN_LOGOUT },
-        { "Reboot", "Restart the machine", "", "", BTN_REBOOT },
-        { "Shut down", "Power off safely", "", "", BTN_SHUTDOWN },
-    };
-
-    for (int i = 0; i < 4; i++) {
-        double ry = cy + 42.0 + i * 44.0;
-        int idx = add_hit(HIT_BUTTON, commands[i].button, 0,
-                          col2 + 10.0, ry, row_w, 40.0);
-        int hot = hit_hover(idx);
-
-        if (hot) {
-            rgba(cr, C_FG, 0.04);
-            rounded_rect(cr, col2 + 10.0, ry, row_w, 40.0, 7.0);
-            cairo_fill(cr);
-        }
-
-        rgba(cr, i >= 2 ? C_RED : C_ACCENT, i >= 2 ? 0.75 : 0.85);
-        cairo_arc(cr, col2 + 28.0, ry + 20.0, 2.6, 0.0, 2.0 * PI);
+    if (smax > 0.0) {
+        double track_x = CONTENT_X + CONTENT_W + 8.0;
+        double track_y = top + 4.0;
+        double track_h = view_h - 8.0;
+        double total_h = APPEARANCE_CONTENT_BOTTOM - top;
+        double thumb_h = track_h * (view_h / total_h);
+        if (thumb_h < 28.0)
+            thumb_h = 28.0;
+        double thumb_y = track_y +
+                         (track_h - thumb_h) * (g_ui.appearance_scroll / smax);
+        rgba(cr, C_FG, 0.05);
+        rounded_rect(cr, track_x, track_y, 3.0, track_h, 1.5);
         cairo_fill(cr);
-
-        text_draw(cr, commands[i].label, 11.0, 600, 0xDCDCDC, 0.95,
-                  col2 + 42.0, ry + 6.0, ALIGN_LEFT, 0.1);
-        text_draw(cr, commands[i].desc, 8.5, 400, C_DIM, 0.72,
-                  col2 + 42.0, ry + 23.0, ALIGN_LEFT, 0.1);
-
-        if (commands[i].key1[0]) {
-            double kw = keycap_width(cr, commands[i].key1) + 5.0 +
-                        keycap_width(cr, commands[i].key2);
-            double kx = col2 + row_w - kw;
-            kx += paint_keycap(cr, commands[i].key1, kx, ry + 10.0) + 5.0;
-            paint_keycap(cr, commands[i].key2, kx, ry + 10.0);
-        }
+        (void)add_hit(HIT_APPEARANCE_SCROLL, 0, 0,
+                      track_x - 4.0, thumb_y, 11.0, thumb_h);
+        rgba(cr, C_FG, 0.20);
+        rounded_rect(cr, track_x, thumb_y, 3.0, thumb_h, 1.5);
+        cairo_fill(cr);
     }
-
-    paint_card(cr, CONTENT_X, by, CONTENT_W, 196.0);
-    text_draw(cr, "Session", 12.0, 600, 0xE8E8E8, 0.95,
-              CONTENT_X + 18.0, by + 16.0, ALIGN_LEFT, 0.1);
-
-    paint_toggle_row(cr, CONTENT_X + 18.0, by + 48.0, inner,
-                     "Restore previous windows",
-                     "Reopen apps from the last session",
-                     g_ui.toggles[TOG_RESTORE], TOG_RESTORE);
-    paint_toggle_row(cr, CONTENT_X + 18.0, by + 90.0, inner,
-                     "Start on last workspace",
-                     "Remember the active desktop",
-                     g_ui.toggles[TOG_LAST_WS], TOG_LAST_WS);
-
-    double rx2 = col2;
-    text_draw(cr, "Startup workspace", 9.0, 500, C_DIM, 0.85,
-              rx2, by + 46.0, ALIGN_LEFT, 0.2);
-    paint_field(cr, rx2, by + 62.0, inner, 32.0, "Workspace 1", 1);
-
-    text_draw(cr, "Environment file", 9.0, 500, C_DIM, 0.85,
-              rx2, by + 106.0, ALIGN_LEFT, 0.2);
-    paint_field(cr, rx2, by + 122.0, inner, 32.0,
-                "~/.config/labwc/environment", 0);
-
-    text_wrap(cr,
-        "Power commands are drawn as real rows, but pressing one only shows "
-        "a preview message. Nothing is executed.",
-        8.8, 400, C_FAINT, 0.8, CONTENT_X, WIN_H - 128.0, CONTENT_W, 2);
 }
+
 
 static double
 photo_zoom_value(void)
@@ -5170,9 +5457,46 @@ paint_field_box(cairo_t *cr, double x, double y, double w, double h,
 /*  Page: Profile                                                      */
 /* ------------------------------------------------------------------ */
 
+#define PROFILE_TOP          102.0
+#define PROFILE_CONTENT_BOTTOM 638.0
+#define PROFILE_NOTE_Y       (WIN_H - 70.0)
+
+static void profile_geom(double *top, double *bottom, double *view_h)
+{
+    *top = PROFILE_TOP;
+    *bottom = PROFILE_NOTE_Y - 12.0;
+    *view_h = *bottom > *top ? *bottom - *top : 0.0;
+}
+
+static double profile_max_scroll(void)
+{
+    double top, bottom, view_h;
+    profile_geom(&top, &bottom, &view_h);
+    (void)top;
+    (void)view_h;
+    return PROFILE_CONTENT_BOTTOM > bottom ? PROFILE_CONTENT_BOTTOM - bottom
+                                            : 0.0;
+}
+
 static void
 page_profile(cairo_t *cr)
 {
+    double top, bottom, view_h;
+    profile_geom(&top, &bottom, &view_h);
+    double smax = profile_max_scroll();
+    if (g_ui.profile_scroll > smax)
+        g_ui.profile_scroll = smax;
+    if (g_ui.profile_scroll < 0.0)
+        g_ui.profile_scroll = 0.0;
+
+    cairo_save(cr);
+    cairo_rectangle(cr, CONTENT_X, top, CONTENT_W, view_h);
+    cairo_clip(cr);
+    cairo_translate(cr, 0.0, -g_ui.profile_scroll);
+    g_hit_dy = -g_ui.profile_scroll;
+    g_hit_clip_top = top;
+    g_hit_clip_bottom = bottom;
+
     section_label(cr, "WEATHER", CONTENT_X, 102.0);
     text_draw(cr, "Location and temperature unit shown in JTLab's status bar",
               9.5, 400, C_DIM, 0.75, CONTENT_X, 117.0, ALIGN_LEFT, 0.1);
@@ -5292,10 +5616,35 @@ page_profile(cairo_t *cr)
     text_wrap(cr, shown, 8.5, 400, C_FAINT, 0.8,
               px, py + 168.0, pw, 1);
 
+    g_hit_dy = 0.0;
+    g_hit_clip_top = -1.0;
+    g_hit_clip_bottom = -1.0;
+    cairo_restore(cr);
+
+    if (smax > 0.0) {
+        double track_x = CONTENT_X + CONTENT_W + 8.0;
+        double track_y = top + 4.0;
+        double track_h = view_h - 8.0;
+        double total_h = PROFILE_CONTENT_BOTTOM - top;
+        double thumb_h = track_h * (view_h / total_h);
+        if (thumb_h < 28.0)
+            thumb_h = 28.0;
+        double thumb_y = track_y +
+                         (track_h - thumb_h) * (g_ui.profile_scroll / smax);
+        rgba(cr, C_FG, 0.05);
+        rounded_rect(cr, track_x, track_y, 3.0, track_h, 1.5);
+        cairo_fill(cr);
+        (void)add_hit(HIT_PROFILE_SCROLL, 0, 0,
+                      track_x - 4.0, thumb_y, 11.0, thumb_h);
+        rgba(cr, C_FG, 0.20);
+        rounded_rect(cr, track_x, thumb_y, 3.0, thumb_h, 1.5);
+        cairo_fill(cr);
+    }
+
     text_wrap(cr,
               "The location, unit, picture and zoom are written to "
               "~/.config/jt/profile.config and applied to JTLab immediately.",
-              8.8, 400, C_FAINT, 0.8, CONTENT_X, 650.0, CONTENT_W, 2);
+              8.8, 400, C_FAINT, 0.8, CONTENT_X, PROFILE_NOTE_Y, CONTENT_W, 2);
 }
 
 /* A small confirmation step that appears right after the portal returns an
@@ -5377,6 +5726,141 @@ zoom_accept(void)
     g_zoom_open = 0;
     profile_save();
     ui_toast("Profile photo saved");
+}
+
+/* ------------------------------------------------------------------ */
+/*  System facts for the About card                                    */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char name[128];
+    char distro[128];
+    char cpu[160];
+    char ram[64];
+    char gpu[192];
+    char age[64];
+} SysFacts;
+
+static SysFacts g_sysfacts;
+
+static void sys_strip_quotes(char *s)
+{
+    size_t n = strlen(s);
+    while (n && isspace((unsigned char)s[n - 1]))
+        s[--n] = '\0';
+    if (n >= 2 && ((s[0] == '"' && s[n - 1] == '"') ||
+                   (s[0] == '\'' && s[n - 1] == '\''))) {
+        memmove(s, s + 1, n - 2);
+        s[n - 2] = '\0';
+    }
+}
+
+/* Read "key=value" or "key: value" from the first matching line of a file. */
+static void sys_read_field(const char *path, const char *key,
+                           char *out, size_t n)
+{
+    out[0] = '\0';
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char line[1024];
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof line, f)) {
+        char *p = startup_trim(line);
+        if (strncasecmp(p, key, klen) ||
+            (p[klen] && p[klen] != '=' && p[klen] != ':' &&
+             !isspace((unsigned char)p[klen])))
+            continue;
+        p += klen;
+        while (*p == '=' || *p == ':' || isspace((unsigned char)*p))
+            p++;
+        sys_strip_quotes(p);
+        snprintf(out, n, "%s", p);
+        break;
+    }
+    fclose(f);
+}
+
+static void sysfacts_init(void)
+{
+    memset(&g_sysfacts, 0, sizeof g_sysfacts);
+
+    if (gethostname(g_sysfacts.name, sizeof g_sysfacts.name) != 0)
+        snprintf(g_sysfacts.name, sizeof g_sysfacts.name, "unknown");
+
+    sys_read_field("/etc/os-release", "PRETTY_NAME",
+                   g_sysfacts.distro, sizeof g_sysfacts.distro);
+    if (!g_sysfacts.distro[0])
+        snprintf(g_sysfacts.distro, sizeof g_sysfacts.distro, "Linux");
+
+    sys_read_field("/proc/cpuinfo", "model name",
+                   g_sysfacts.cpu, sizeof g_sysfacts.cpu);
+    if (!g_sysfacts.cpu[0])
+        sys_read_field("/proc/cpuinfo", "Hardware",
+                       g_sysfacts.cpu, sizeof g_sysfacts.cpu);
+    if (!g_sysfacts.cpu[0])
+        snprintf(g_sysfacts.cpu, sizeof g_sysfacts.cpu, "Unknown CPU");
+
+    char mem[64] = "0";
+    sys_read_field("/proc/meminfo", "MemTotal", mem, sizeof mem);
+    snprintf(g_sysfacts.ram, sizeof g_sysfacts.ram, "%.1f GiB",
+             atof(mem) / 1048576.0);
+
+    FILE *pci = popen("lspci 2>/dev/null | grep -i -m1 -E 'vga|3d controller'",
+                      "r");
+    if (pci) {
+        char line[512];
+        if (fgets(line, sizeof line, pci)) {
+            char *sep = strstr(line, ": ");
+            if (sep) {
+                sep += 2;
+                sys_strip_quotes(sep);
+                snprintf(g_sysfacts.gpu, sizeof g_sysfacts.gpu, "%s", sep);
+            }
+        }
+        pclose(pci);
+    }
+    if (!g_sysfacts.gpu[0])
+        snprintf(g_sysfacts.gpu, sizeof g_sysfacts.gpu, "Not detected");
+    else {
+        /* Drop the vendor prefix and "(rev NN)" so the useful model name
+         * gets the space it needs in a narrow card column. */
+        static const char *const vendors[] = {
+            "Intel Corporation ", "NVIDIA Corporation ",
+            "Advanced Micro Devices, Inc. ", "ATI Technologies Inc. ",
+        };
+        for (size_t i = 0; i < sizeof vendors / sizeof vendors[0]; i++) {
+            size_t vl = strlen(vendors[i]);
+            if (!strncmp(g_sysfacts.gpu, vendors[i], vl)) {
+                memmove(g_sysfacts.gpu, g_sysfacts.gpu + vl,
+                        strlen(g_sysfacts.gpu) - vl + 1);
+                break;
+            }
+        }
+        char *rev = strstr(g_sysfacts.gpu, " (rev ");
+        if (rev)
+            *rev = '\0';
+    }
+
+    /* Same measure fastfetch uses: days since the birth time of "/". */
+    time_t born = 0;
+    struct statx stx;
+    if (statx(AT_FDCWD, "/", AT_STATX_SYNC_AS_STAT, STATX_BTIME, &stx) == 0 &&
+        (stx.stx_mask & STATX_BTIME) && stx.stx_btime.tv_sec > 0)
+        born = (time_t)stx.stx_btime.tv_sec;
+    else {
+        struct stat st;
+        if (stat("/", &st) == 0)
+            born = st.st_ctim.tv_sec;
+    }
+    if (born > 0) {
+        long long days = (long long)(time(NULL) - born) / 86400;
+        if (days < 0)
+            days = 0;
+        snprintf(g_sysfacts.age, sizeof g_sysfacts.age, "%lld days", days);
+    } else {
+        snprintf(g_sysfacts.age, sizeof g_sysfacts.age, "unknown");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -5466,13 +5950,11 @@ static void page_about(cairo_t *cr)
     paint_card(cr, gx, gy, gw, gh);
 
     static const char *const keys[] = {
-        "Compositor", "Toolkit", "Palette", "Interface font",
-        "Control socket", "Configuration",
+        "PC name", "Distro", "CPU", "RAM", "GPU", "OS age",
     };
-    static const char *const vals[] = {
-        "jtlabwc · Wayland", "cairo + Pango · no GTK",
-        "#030303 · amber #E8A03C", "Liberation Sans · 10 pt",
-        "$XDG_RUNTIME_DIR/jtsettings-ctl.sock", "~/jt",
+    const char *const vals[] = {
+        g_sysfacts.name, g_sysfacts.distro, g_sysfacts.cpu,
+        g_sysfacts.ram, g_sysfacts.gpu, g_sysfacts.age,
     };
 
     for (int i = 0; i < 6; i++) {
@@ -5483,8 +5965,8 @@ static void page_about(cairo_t *cr)
 
         text_draw(cr, keys[i], 8.0, 600, C_FAINT, 0.9,
                   kx, ky, ALIGN_LEFT, 1.4);
-        text_draw(cr, vals[i], 10.5, 500, 0xDCDCDC, 0.92,
-                  kx, ky + 18.0, ALIGN_LEFT, 0.1);
+        text_wrap(cr, vals[i], 10.5, 500, 0xDCDCDC, 0.92,
+                  kx, ky + 18.0, gw / 2.0 - 40.0, 1);
 
         if (col == 0 && i + 2 < 6)
             paint_divider(cr, gx + 24.0, ky + 48.0, gw - 48.0);
@@ -5562,11 +6044,9 @@ static void paint_content(cairo_t *cr)
     case PAGE_KEYBINDINGS: page_keybindings(cr); break;
     case PAGE_STARTUP: page_startup(cr); break;
     case PAGE_DEFAULT_APPS: page_defaultapps(cr); break;
-    case PAGE_RULES: page_rules(cr); break;
     case PAGE_INPUT: page_input(cr); break;
     case PAGE_DISPLAYS: page_displays(cr); break;
     case PAGE_APPEARANCE: page_appearance(cr); break;
-    case PAGE_SESSION: page_session(cr); break;
     case PAGE_PROFILE: page_profile(cr); break;
     case PAGE_ABOUT: page_about(cr); break;
     default: break;
@@ -6872,9 +7352,6 @@ static void ui_activate(App *a, int idx)
             break;
         }
         switch (h->a) {
-        case BTN_NEW_RULE:
-            ui_toast("Preview only — window rules are not saved");
-            break;
         case BTN_DOCS:
             if (open_url("https://github.com/arch-user-sudo/JTDE"))
                 ui_toast("Opening JTDE documentation…");
@@ -6998,6 +7475,14 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     g_ui.hover = -1;
     g_ui.pressed = -1;
     g_ui.kb_drag = 0;
+    g_ui.kb_filter_drag = 0;
+    g_ui.startup_drag = 0;
+    g_ui.defapp_drag = 0;
+    g_ui.input_drag = 0;
+    g_ui.disp_hdrag = 0;
+    g_ui.profile_drag = 0;
+    g_ui.appearance_drag = 0;
+    g_ui.nav_drag = 0;
     a->dirty = 1;
     update_cursor(a);
 }
@@ -7037,6 +7522,102 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
                 h->dirty = 1;
             }
         }
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.kb_filter_drag) {
+        double delta = g_ui.pointer_x - g_ui.kb_filter_drag_x;
+        if (fabs(delta) > 3.0)
+            g_ui.kb_filter_drag_moved = 1;
+        g_ui.kb_filter_scroll = clampd(
+            g_ui.kb_filter_drag_scroll + delta, 0.0, kb_filter_max_scroll());
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.startup_drag) {
+        double delta = g_ui.pointer_y - g_ui.startup_drag_y;
+        if (fabs(delta) > 3.0)
+            g_ui.startup_drag_moved = 1;
+        g_ui.startup_scroll = clampd(g_ui.startup_drag_scroll + delta,
+                                     0.0, startup_max_scroll());
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.defapp_drag) {
+        double delta = g_ui.pointer_y - g_ui.defapp_drag_y;
+        if (fabs(delta) > 3.0)
+            g_ui.defapp_drag_moved = 1;
+        g_ui.defapp_scroll = clampd(g_ui.defapp_drag_scroll + delta,
+                                    0.0, defapp_max_scroll());
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.input_drag) {
+        double delta = g_ui.pointer_y - g_ui.input_drag_y;
+        if (fabs(delta) > 3.0)
+            g_ui.input_drag_moved = 1;
+        g_ui.input_scroll = clampd(g_ui.input_drag_scroll + delta,
+                                   0.0, input_max_scroll());
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.disp_hdrag) {
+        double delta = g_ui.pointer_x - g_ui.disp_hdrag_x;
+        if (fabs(delta) > 3.0)
+            g_ui.disp_hdrag_moved = 1;
+        g_ui.disp_hscroll = clampd(g_ui.disp_hdrag_scroll + delta,
+                                   0.0, disp_hmax_scroll());
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.profile_drag) {
+        double delta = g_ui.pointer_y - g_ui.profile_drag_y;
+        if (fabs(delta) > 3.0)
+            g_ui.profile_drag_moved = 1;
+        g_ui.profile_scroll = clampd(g_ui.profile_drag_scroll + delta,
+                                     0.0, profile_max_scroll());
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.appearance_drag) {
+        double delta = g_ui.pointer_y - g_ui.appearance_drag_y;
+        if (fabs(delta) > 3.0)
+            g_ui.appearance_drag_moved = 1;
+        g_ui.appearance_scroll = clampd(g_ui.appearance_drag_scroll + delta,
+                                        0.0, appearance_max_scroll());
+        g_ui.hover = -1;
+        a->dirty = 1;
+        update_cursor(a);
+        return;
+    }
+
+    if (g_ui.nav_drag) {
+        double delta = g_ui.pointer_y - g_ui.nav_drag_y;
+        if (fabs(delta) > 3.0)
+            g_ui.nav_drag_moved = 1;
+        g_ui.nav_scroll = clampd(g_ui.nav_drag_scroll + delta,
+                                 0.0, nav_max_scroll());
         g_ui.hover = -1;
         a->dirty = 1;
         update_cursor(a);
@@ -7136,6 +7717,54 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     int idx = hit_at(x, y);
 
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (idx >= 0 && g_hits[idx].kind == HIT_KB_FILTER_SCROLL) {
+            g_ui.kb_filter_drag = 1;
+            g_ui.kb_filter_drag_moved = 0;
+            g_ui.kb_filter_drag_x = x;
+            g_ui.kb_filter_drag_scroll = g_ui.kb_filter_scroll;
+        }
+        if (idx >= 0 && g_hits[idx].kind == HIT_STARTUP_SCROLL) {
+            g_ui.startup_drag = 1;
+            g_ui.startup_drag_moved = 0;
+            g_ui.startup_drag_y = y;
+            g_ui.startup_drag_scroll = g_ui.startup_scroll;
+        }
+        if (idx >= 0 && g_hits[idx].kind == HIT_DEFAPP_SCROLL) {
+            g_ui.defapp_drag = 1;
+            g_ui.defapp_drag_moved = 0;
+            g_ui.defapp_drag_y = y;
+            g_ui.defapp_drag_scroll = g_ui.defapp_scroll;
+        }
+        if (idx >= 0 && g_hits[idx].kind == HIT_INPUT_SCROLL) {
+            g_ui.input_drag = 1;
+            g_ui.input_drag_moved = 0;
+            g_ui.input_drag_y = y;
+            g_ui.input_drag_scroll = g_ui.input_scroll;
+        }
+        if (idx >= 0 && g_hits[idx].kind == HIT_DISP_HSCROLL) {
+            g_ui.disp_hdrag = 1;
+            g_ui.disp_hdrag_moved = 0;
+            g_ui.disp_hdrag_x = x;
+            g_ui.disp_hdrag_scroll = g_ui.disp_hscroll;
+        }
+        if (idx >= 0 && g_hits[idx].kind == HIT_PROFILE_SCROLL) {
+            g_ui.profile_drag = 1;
+            g_ui.profile_drag_moved = 0;
+            g_ui.profile_drag_y = y;
+            g_ui.profile_drag_scroll = g_ui.profile_scroll;
+        }
+        if (idx >= 0 && g_hits[idx].kind == HIT_APPEARANCE_SCROLL) {
+            g_ui.appearance_drag = 1;
+            g_ui.appearance_drag_moved = 0;
+            g_ui.appearance_drag_y = y;
+            g_ui.appearance_drag_scroll = g_ui.appearance_scroll;
+        }
+        if (idx >= 0 && g_hits[idx].kind == HIT_NAV_SCROLL) {
+            g_ui.nav_drag = 1;
+            g_ui.nav_drag_moved = 0;
+            g_ui.nav_drag_y = y;
+            g_ui.nav_drag_scroll = g_ui.nav_scroll;
+        }
         if (g_ui.pos_editor_open) {
             double pw = 700.0, ph = 420.0;
             double px = (WIN_W - pw) / 2.0;
@@ -7204,9 +7833,30 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
         }
         int kind = (idx >= 0) ? g_hits[idx].kind : HIT_NONE;
         int pressed = g_ui.pressed;
-        int was_drag = g_ui.kb_drag && g_ui.kb_drag_moved;
+        int was_drag = (g_ui.kb_drag && g_ui.kb_drag_moved) ||
+                       (g_ui.nav_drag && g_ui.nav_drag_moved) ||
+                       (g_ui.startup_drag && g_ui.startup_drag_moved) ||
+                       (g_ui.defapp_drag && g_ui.defapp_drag_moved) ||
+                       (g_ui.input_drag && g_ui.input_drag_moved) ||
+                       (g_ui.disp_hdrag && g_ui.disp_hdrag_moved) ||
+                       (g_ui.profile_drag && g_ui.profile_drag_moved) ||
+                       (g_ui.appearance_drag && g_ui.appearance_drag_moved) ||
+                       (g_ui.kb_filter_drag && g_ui.kb_filter_drag_moved);
         g_ui.kb_drag = 0;
-        if (idx >= 0 && idx == pressed && kind != HIT_SLIDER && !was_drag)
+        g_ui.nav_drag = 0;
+        g_ui.startup_drag = 0;
+        g_ui.defapp_drag = 0;
+        g_ui.input_drag = 0;
+        g_ui.disp_hdrag = 0;
+        g_ui.profile_drag = 0;
+        g_ui.appearance_drag = 0;
+        g_ui.kb_filter_drag = 0;
+        if (idx >= 0 && idx == pressed && kind != HIT_SLIDER &&
+            kind != HIT_NAV_SCROLL && kind != HIT_STARTUP_SCROLL &&
+            kind != HIT_DEFAPP_SCROLL &&
+            kind != HIT_INPUT_SCROLL && kind != HIT_DISP_HSCROLL &&
+            kind != HIT_PROFILE_SCROLL && kind != HIT_APPEARANCE_SCROLL &&
+            kind != HIT_KB_FILTER_SCROLL && !was_drag)
             ui_activate(a, idx);
         if (pressed >= 0 && pressed < g_hit_count &&
             g_hits[pressed].kind == HIT_SLIDER) {
@@ -7224,7 +7874,13 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
             }
         }
         g_ui.pressed = -1;
-        g_ui.hover = (kind == HIT_NAV) ? -1 : hit_at(x, y);
+        g_ui.hover = (kind == HIT_NAV || kind == HIT_NAV_SCROLL ||
+                      kind == HIT_STARTUP_SCROLL ||
+                      kind == HIT_DEFAPP_SCROLL || kind == HIT_INPUT_SCROLL ||
+                      kind == HIT_DISP_HSCROLL || kind == HIT_PROFILE_SCROLL ||
+                      kind == HIT_APPEARANCE_SCROLL ||
+                      kind == HIT_KB_FILTER_SCROLL)
+                         ? -1 : hit_at(x, y);
     }
     a->dirty = 1;
     update_cursor(a);
@@ -7236,8 +7892,170 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
     (void)pointer; (void)time;
     App *a = data;
 
-    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+    int horizontal = axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL && !horizontal)
         return;
+    double amount = wl_fixed_to_double(value) * 2.0;
+
+    if (g_ui.page == PAGE_KEYBINDINGS && !g_ui.app_picker_open &&
+        kb_filter_row_at(g_ui.pointer_x, g_ui.pointer_y)) {
+        double max = kb_filter_max_scroll();
+        if (max > 0.0) {
+            double next = clampd(g_ui.kb_filter_scroll + amount, 0.0, max);
+            if (next != g_ui.kb_filter_scroll) {
+                g_ui.kb_filter_scroll = next;
+                g_hit_count = 0;
+                g_ui.hover = -1;
+                g_ui.pressed = -1;
+                a->dirty = 1;
+            }
+        }
+        return;
+    }
+
+    if (g_ui.page == PAGE_DISPLAYS && !g_ui.pos_editor_open &&
+        !g_ui.mode_picker_open && horizontal) {
+        double max = disp_hmax_scroll();
+        if (max > 0.0) {
+            double next = clampd(g_ui.disp_hscroll + amount, 0.0, max);
+            if (next != g_ui.disp_hscroll) {
+                g_ui.disp_hscroll = next;
+                g_hit_count = 0;
+                g_ui.hover = -1;
+                g_ui.pressed = -1;
+                a->dirty = 1;
+            }
+        }
+        return;
+    }
+
+    if (horizontal)
+        return;
+
+    if (g_ui.pointer_x >= 0.0 && g_ui.pointer_x <= SIDEBAR_W &&
+        g_ui.pointer_y >= NAV_TOP && g_ui.pointer_y <= nav_view_bottom()) {
+        double max = nav_max_scroll();
+        if (max > 0.0) {
+            double next = clampd(g_ui.nav_scroll + amount, 0.0, max);
+            if (next != g_ui.nav_scroll) {
+                g_ui.nav_scroll = next;
+                g_hit_count = 0;
+                g_ui.hover = -1;
+                g_ui.pressed = -1;
+                a->dirty = 1;
+            }
+        }
+        return;
+    }
+
+    if (g_ui.page == PAGE_INPUT) {
+        double top, bottom, view_h;
+        input_geom(&top, &bottom, &view_h);
+        (void)view_h;
+        if (g_ui.pointer_x >= CONTENT_X &&
+            g_ui.pointer_x <= CONTENT_X + CONTENT_W + 20.0 &&
+            g_ui.pointer_y >= top && g_ui.pointer_y <= bottom) {
+            double max = input_max_scroll();
+            if (max > 0.0) {
+                double next = clampd(g_ui.input_scroll + amount, 0.0, max);
+                if (next != g_ui.input_scroll) {
+                    g_ui.input_scroll = next;
+                    g_hit_count = 0;
+                    g_ui.hover = -1;
+                    g_ui.pressed = -1;
+                    a->dirty = 1;
+                }
+            }
+            return;
+        }
+    }
+
+    if (g_ui.page == PAGE_APPEARANCE) {
+        double top, bottom, view_h;
+        appearance_geom(&top, &bottom, &view_h);
+        (void)view_h;
+        if (g_ui.pointer_x >= CONTENT_X &&
+            g_ui.pointer_x <= CONTENT_X + CONTENT_W + 20.0 &&
+            g_ui.pointer_y >= top && g_ui.pointer_y <= bottom) {
+            double max = appearance_max_scroll();
+            if (max > 0.0) {
+                double next = clampd(g_ui.appearance_scroll + amount, 0.0, max);
+                if (next != g_ui.appearance_scroll) {
+                    g_ui.appearance_scroll = next;
+                    g_hit_count = 0;
+                    g_ui.hover = -1;
+                    g_ui.pressed = -1;
+                    a->dirty = 1;
+                }
+            }
+            return;
+        }
+    }
+
+    if (g_ui.page == PAGE_PROFILE && !g_zoom_open &&
+        !g_ui.wx_editing && !g_ui.wx_query_editing) {
+        double top, bottom, view_h;
+        profile_geom(&top, &bottom, &view_h);
+        (void)view_h;
+        if (g_ui.pointer_x >= CONTENT_X &&
+            g_ui.pointer_x <= CONTENT_X + CONTENT_W + 20.0 &&
+            g_ui.pointer_y >= top && g_ui.pointer_y <= bottom) {
+            double max = profile_max_scroll();
+            if (max > 0.0) {
+                double next = clampd(g_ui.profile_scroll + amount, 0.0, max);
+                if (next != g_ui.profile_scroll) {
+                    g_ui.profile_scroll = next;
+                    g_hit_count = 0;
+                    g_ui.hover = -1;
+                    g_ui.pressed = -1;
+                    a->dirty = 1;
+                }
+            }
+            return;
+        }
+    }
+
+    if (g_ui.page == PAGE_DEFAULT_APPS && !g_ui.app_picker_open) {
+        double top, bottom, view_h;
+        defapp_geom(&top, &bottom, &view_h);
+        if (g_ui.pointer_x >= CONTENT_X &&
+            g_ui.pointer_x <= CONTENT_X + CONTENT_W + 20.0 &&
+            g_ui.pointer_y >= top && g_ui.pointer_y <= bottom) {
+            double max = defapp_max_scroll();
+            if (max > 0.0) {
+                double next = clampd(g_ui.defapp_scroll + amount, 0.0, max);
+                if (next != g_ui.defapp_scroll) {
+                    g_ui.defapp_scroll = next;
+                    g_hit_count = 0;
+                    g_ui.hover = -1;
+                    g_ui.pressed = -1;
+                    a->dirty = 1;
+                }
+            }
+            return;
+        }
+    }
+
+    if (g_ui.page == PAGE_STARTUP) {
+        double top, bottom, view_h;
+        startup_geom(&top, &bottom, &view_h);
+        if (g_ui.pointer_x >= CONTENT_X &&
+            g_ui.pointer_x <= CONTENT_X + CONTENT_W + 20.0 &&
+            g_ui.pointer_y >= top && g_ui.pointer_y <= bottom) {
+            double max = startup_max_scroll();
+            if (max > 0.0) {
+                double next = clampd(g_ui.startup_scroll + amount, 0.0, max);
+                if (next != g_ui.startup_scroll) {
+                    g_ui.startup_scroll = next;
+                    g_hit_count = 0;
+                    g_ui.hover = -1;
+                    g_ui.pressed = -1;
+                    a->dirty = 1;
+                }
+            }
+            return;
+        }
+    }
 
     if (g_ui.app_picker_open) {
         int max = app_picker_scroll_max();
@@ -7293,7 +8111,7 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
     kb_geom(&ty, &th, &view_h);
     (void)view_h;
     if (g_ui.pointer_x < CONTENT_X ||
-        g_ui.pointer_x > CONTENT_X + CONTENT_W ||
+        g_ui.pointer_x > CONTENT_X + CONTENT_W + 20.0 ||
         g_ui.pointer_y < ty || g_ui.pointer_y > ty + th)
         return;
 
@@ -7967,13 +8785,13 @@ static int wayland_start(App *a)
     xdg_toplevel_add_listener(a->toplevel, &toplevel_listener, a);
     xdg_toplevel_set_title(a->toplevel, "JTLab Settings");
     xdg_toplevel_set_app_id(a->toplevel, "jtsettings");
-    xdg_toplevel_set_min_size(a->toplevel, (int)DESIGN_W, (int)DESIGN_H);
+    xdg_toplevel_set_min_size(a->toplevel, (int)MIN_W, (int)MIN_H);
 
     if (a->state_w > 0 && a->state_h > 0) {
-        if (a->state_w < (int)DESIGN_W)
-            a->state_w = (int)DESIGN_W;
-        if (a->state_h < (int)DESIGN_H)
-            a->state_h = (int)DESIGN_H;
+        if (a->state_w < (int)MIN_W)
+            a->state_w = (int)MIN_W;
+        if (a->state_h < (int)MIN_H)
+            a->state_h = (int)MIN_H;
         WIN_W = a->state_w;
         WIN_H = a->state_h;
     }
@@ -8053,8 +8871,6 @@ static int page_from_name(const char *s)
     if (!strcasecmp(s, "apps") || !strcasecmp(s, "default apps") ||
         !strcasecmp(s, "defaults") || !strcasecmp(s, "default"))
         return PAGE_DEFAULT_APPS;
-    if (!strcasecmp(s, "rules") || !strcasecmp(s, "window rules"))
-        return PAGE_RULES;
     if (!strcasecmp(s, "input") || !strcasecmp(s, "mouse") ||
         !strcasecmp(s, "keyboard"))
         return PAGE_INPUT;
@@ -8064,8 +8880,6 @@ static int page_from_name(const char *s)
     if (!strcasecmp(s, "appearance") || !strcasecmp(s, "appear") ||
         !strcasecmp(s, "theme"))
         return PAGE_APPEARANCE;
-    if (!strcasecmp(s, "session") || !strcasecmp(s, "power"))
-        return PAGE_SESSION;
     if (!strcasecmp(s, "profile") || !strcasecmp(s, "weather") ||
         !strcasecmp(s, "avatar"))
         return PAGE_PROFILE;
@@ -8613,8 +9427,8 @@ static void usage(const char *argv0)
         "usage: %s [#RRGGBB] [--accent #RRGGBB] [--page NAME]\n"
         "       %s --screenshot FILE [--page NAME]\n"
         "\n"
-        "Pages: keybindings, startup, apps, rules, input,\n"
-        "       displays, appearance, session, profile, about\n",
+        "Pages: keybindings, startup, apps, input, displays,\n"
+        "       appearance, profile, about\n",
         argv0, argv0);
 }
 
