@@ -5999,6 +5999,7 @@ static const RepoLink ABOUT_REPOS[] = {
     { "jtwpi",       "https://github.com/arch-user-sudo/jtwpi/activity" },
     { "jtpolkit",    "https://github.com/arch-user-sudo/jtpolkit/activity" },
     { "jtgreeter",   "https://github.com/arch-user-sudo/jtgreeter/activity" },
+    { "jtfiles",     "https://github.com/arch-user-sudo/jtfiles/activity" },
 };
 #define ABOUT_REPO_COUNT ((int)(sizeof ABOUT_REPOS / sizeof ABOUT_REPOS[0]))
 
