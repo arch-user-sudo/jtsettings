@@ -98,8 +98,12 @@ static double WIN_H = DESIGN_H;
 #define DISPLAY_BTN_Y       (WIN_H - 110.0)
 #define DISPLAY_VIEW_TOP    118.0
 #define DISPLAY_VIEW_BOTTOM (DISPLAY_BTN_Y - 10.0)
+#define DISPLAY_CARD_H      224.0
+#define DISPLAY_CARD_PITCH  238.0
 #define DISP_HCONTENT_W     (DESIGN_W - CONTENT_X - 36.0)
-#define DISP_HSCROLL_Y      (DISPLAY_VIEW_BOTTOM + 2.0)
+/* The horizontal scrollbar lives inside every card, inset from its edges. */
+#define DISP_HSCROLL_PAD    18.0
+#define DISP_HSCROLL_YOFF   211.0
 
 /* About page: the content column has fixed document coordinates; only the
  * viewport follows the window height. */
@@ -1302,8 +1306,10 @@ static int add_hit(int kind, int a, int b,
     y += g_hit_dy;
 
     /* Display cards scroll inside a clipped viewport.  Do not register
-     * controls that are scrolled underneath the header or action row. */
-    if (kind >= HIT_DISP_RES && kind <= HIT_DISP_MODE &&
+     * controls (or a card's own scrollbar) that are scrolled underneath
+     * the header or action row. */
+    if (((kind >= HIT_DISP_RES && kind <= HIT_DISP_MODE) ||
+         kind == HIT_DISP_HSCROLL) &&
         !g_ui.mode_picker_open &&
         (y < DISPLAY_VIEW_TOP || y + h > DISPLAY_VIEW_BOTTOM))
         return -1;
@@ -5072,12 +5078,39 @@ static void disp_hclamp(void)
         g_ui.disp_hscroll = max;
 }
 
+/* Each output card carries its own horizontal scrollbar, inset from both
+ * edges so it lines up with the preview and control columns. */
+static void paint_disp_hscroll(cairo_t *cr, double y)
+{
+    double hmax = disp_hmax_scroll();
+    if (hmax <= 0.0)
+        return;
+
+    double track_x = CONTENT_X + DISP_HSCROLL_PAD;
+    double track_y = y + DISP_HSCROLL_YOFF;
+    double track_w = CONTENT_W - 2.0 * DISP_HSCROLL_PAD;
+    double thumb_w = track_w * (CONTENT_W / DISP_HCONTENT_W);
+    if (thumb_w < 28.0)
+        thumb_w = 28.0;
+    double thumb_x = track_x +
+                     (track_w - thumb_w) * (g_ui.disp_hscroll / hmax);
+
+    rgba(cr, C_FG, 0.05);
+    rounded_rect(cr, track_x, track_y, track_w, 3.0, 1.5);
+    cairo_fill(cr);
+    (void)add_hit(HIT_DISP_HSCROLL, 0, 0,
+                  thumb_x - 2.0, track_y - 4.0, thumb_w + 4.0, 11.0);
+    rgba(cr, C_FG, 0.20);
+    rounded_rect(cr, thumb_x, track_y, thumb_w, 3.0, 1.5);
+    cairo_fill(cr);
+}
+
 static void display_card(cairo_t *cr, int idx, double y, double sx)
 {
     Head *h = &g_heads[idx];
     int connected = h->p_enabled;
 
-    paint_card(cr, CONTENT_X, y, CONTENT_W, 206.0);
+    paint_card(cr, CONTENT_X, y, CONTENT_W, DISPLAY_CARD_H);
     paint_display_preview(cr, CONTENT_X + 18.0 + sx, y + 18.0, 196.0, 140.0,
                           connected);
 
@@ -5173,6 +5206,8 @@ static void display_card(cairo_t *cr, int idx, double y, double sx)
     text_wrap(cr, status, 8.5, 400, connected ? C_GREEN : C_FAINT,
               connected ? 0.8 : 0.7, CONTENT_X + 18.0 + sx, y + 172.0,
               196.0, 1);
+
+    paint_disp_hscroll(cr, y);
 }
 
 static void page_displays(cairo_t *cr)
@@ -5184,7 +5219,7 @@ static void page_displays(cairo_t *cr)
     double btn_y = DISPLAY_BTN_Y;
     double view_top = DISPLAY_VIEW_TOP;
     double view_bottom = DISPLAY_VIEW_BOTTOM;
-    int max_scroll = (int)(n * 220.0 - (view_bottom - view_top));
+    int max_scroll = (int)(n * DISPLAY_CARD_PITCH - (view_bottom - view_top));
     if (max_scroll < 0)
         max_scroll = 0;
     if (g_ui.disp_scroll > max_scroll)
@@ -5203,7 +5238,7 @@ static void page_displays(cairo_t *cr)
               WIN_W - 36.0, 102.0, ALIGN_RIGHT, 0.2);
 
     if (n == 0) {
-        paint_card(cr, CONTENT_X, 122.0, CONTENT_W, 206.0);
+        paint_card(cr, CONTENT_X, 122.0, CONTENT_W, DISPLAY_CARD_H);
         text_draw(cr, g_output_manager_available
                        ? "No outputs detected"
                        : "Output management unavailable",
@@ -5234,9 +5269,9 @@ static void page_displays(cairo_t *cr)
         for (int i = 0; i < MAX_HEADS; i++) {
             if (!g_heads[i].used)
                 continue;
-            double y = 122.0 + ord * 220.0 - g_ui.disp_scroll;
+            double y = 122.0 + ord * DISPLAY_CARD_PITCH - g_ui.disp_scroll;
             ord++;
-            if (y + 206.0 < view_top || y > view_bottom)
+            if (y + DISPLAY_CARD_H < view_top || y > view_bottom)
                 continue;
             display_card(cr, i, y, sx);
         }
@@ -5245,25 +5280,6 @@ static void page_displays(cairo_t *cr)
         g_hit_clip_left = -1.0;
         g_hit_clip_right = -1.0;
         cairo_restore(cr);
-    }
-
-    double hmax = disp_hmax_scroll();
-    if (hmax > 0.0) {
-        double track_x = CONTENT_X;
-        double track_y = DISP_HSCROLL_Y;
-        double thumb_w = CONTENT_W * (CONTENT_W / DISP_HCONTENT_W);
-        if (thumb_w < 28.0)
-            thumb_w = 28.0;
-        double thumb_x = track_x +
-                         (CONTENT_W - thumb_w) * (g_ui.disp_hscroll / hmax);
-        rgba(cr, C_FG, 0.05);
-        rounded_rect(cr, track_x, track_y, CONTENT_W, 3.0, 1.5);
-        cairo_fill(cr);
-        (void)add_hit(HIT_DISP_HSCROLL, 0, 0,
-                      thumb_x, track_y - 4.0, thumb_w, 11.0);
-        rgba(cr, C_FG, 0.20);
-        rounded_rect(cr, thumb_x, track_y, thumb_w, 3.0, 1.5);
-        cairo_fill(cr);
     }
 
     paint_button(cr, CONTENT_X, btn_y, 140.0, 36.0,
