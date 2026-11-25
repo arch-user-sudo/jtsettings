@@ -5223,7 +5223,10 @@ static void page_displays(cairo_t *cr)
                             view_bottom - view_top);
         cairo_clip(cr);
         double sx = -g_ui.disp_hscroll;
-        g_hit_dx = sx;
+        /* display_card() applies sx to each control's coordinates, and
+         * add_hit() stores those coordinates as-is.  Do not also set
+         * g_hit_dx here or every hit rect shifts twice. */
+        g_hit_dx = 0.0;
         g_hit_clip_left = CONTENT_X;
         g_hit_clip_right = CONTENT_X + CONTENT_W;
 
