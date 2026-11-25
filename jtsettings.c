@@ -486,6 +486,7 @@ enum {
     TOG_PRIMARY_A,
     TOG_PRIMARY_B,
     TOG_BORDER_ANIM,
+    TOG_WINDOW_BUTTONS,
     TOG_COUNT
 };
 
@@ -845,7 +846,7 @@ static int input_toggle(int toggle);
 /* Appearance settings live in ~/.config/jt/appearance.conf. */
 static int appearance_load(void);
 static void appearance_save(void);
-static void appearance_commit(void);
+static void appearance_commit(int toggle);
 
 /* The default terminal command lives in ~/.config/jt/keybinds.conf. */
 static int keybinds_load(void);
@@ -969,6 +970,7 @@ static void ui_init(void)
     g_ui.toggles[TOG_PRIMARY_A] = 1;
     g_ui.toggles[TOG_PRIMARY_B] = 0;
     g_ui.toggles[TOG_BORDER_ANIM] = 0;
+    g_ui.toggles[TOG_WINDOW_BUTTONS] = 1;
 
     g_ui.sliders[SL_POINTER] = 0.52;
     g_ui.sliders[SL_REPEAT] = (45.0 - 15.0) / 65.0;
@@ -3045,41 +3047,89 @@ appearance_config_path(char *buf, size_t n)
              APPEARANCE_DIR, APPEARANCE_FILE);
 }
 
+/* GTK and other client-side-decorated apps read this key when they start. */
+#define APPEARANCE_GTK_SCHEMA "org.gnome.desktop.wm.preferences"
+#define APPEARANCE_GTK_KEY    "button-layout"
+
+/* Run `gsettings get/set ...` without going through a shell.  Returns 1 only
+ * when the command succeeded; `out` receives trimmed stdout when provided. */
+static int
+appearance_gsettings(const char *action, const char *value,
+                     char *out, size_t n)
+{
+    GError *err = NULL;
+    gchar *stdout_buf = NULL, *stderr_buf = NULL;
+    gint status = -1;
+    char cmd[320];
+
+    if (out)
+        out[0] = '\0';
+    snprintf(cmd, sizeof cmd, "gsettings %s %s %s%s%s",
+             action, APPEARANCE_GTK_SCHEMA, APPEARANCE_GTK_KEY,
+             value ? " " : "", value ? value : "");
+
+    int ok = g_spawn_command_line_sync(cmd, &stdout_buf, &stderr_buf,
+                                       &status, &err) &&
+             status == 0;
+    if (ok && out && stdout_buf)
+        snprintf(out, n, "%s", startup_trim(stdout_buf));
+    if (err)
+        g_error_free(err);
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+    return ok;
+}
+
 static int
 appearance_load(void)
 {
     char path[APPEARANCE_PATH_MAX];
     appearance_config_path(path, sizeof path);
 
+    int loaded = 0;
     FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof line, f)) {
+            char *s = startup_trim(line);
+            if (!*s || *s == '#') continue;
 
-    char line[256];
-    while (fgets(line, sizeof line, f)) {
-        char *s = startup_trim(line);
-        if (!*s || *s == '#') continue;
+            char *eq = strchr(s, '=');
+            char *key = "";
+            char *value = s;
+            if (eq) {
+                *eq = '\0';
+                key = startup_trim(s);
+                value = startup_trim(eq + 1);
+            }
+            if (!*value) continue;
 
-        char *eq = strchr(s, '=');
-        char *key = "";
-        char *value = s;
-        if (eq) {
-            *eq = '\0';
-            key = startup_trim(s);
-            value = startup_trim(eq + 1);
+            /* jtlabwc also accepts a bare true/false with no key. */
+            if (!*key || !strcasecmp(key, "accent_border_animation") ||
+                !strcasecmp(key, "jtlabwc_border_anim_enabled")) {
+                if (!strcasecmp(value, "true") || !strcmp(value, "1"))
+                    g_ui.toggles[TOG_BORDER_ANIM] = 1;
+                else if (!strcasecmp(value, "false") || !strcmp(value, "0"))
+                    g_ui.toggles[TOG_BORDER_ANIM] = 0;
+            } else if (!strcasecmp(key, "window_buttons")) {
+                if (!strcasecmp(value, "true") || !strcmp(value, "1"))
+                    g_ui.toggles[TOG_WINDOW_BUTTONS] = 1;
+                else if (!strcasecmp(value, "false") || !strcmp(value, "0"))
+                    g_ui.toggles[TOG_WINDOW_BUTTONS] = 0;
+            }
         }
-        if (!*value) continue;
-
-        /* jtlabwc also accepts a bare true/false with no key. */
-        if (!*key || !strcasecmp(key, "accent_border_animation") ||
-            !strcasecmp(key, "jtlabwc_border_anim_enabled")) {
-            if (!strcasecmp(value, "true") || !strcmp(value, "1"))
-                g_ui.toggles[TOG_BORDER_ANIM] = 1;
-            else if (!strcasecmp(value, "false") || !strcmp(value, "0"))
-                g_ui.toggles[TOG_BORDER_ANIM] = 0;
-        }
+        fclose(f);
+        loaded = 1;
     }
-    fclose(f);
-    return 1;
+
+    /* The effective GTK layout wins over the saved preference, so the switch
+     * reflects reality even when gsettings was changed from elsewhere. */
+    char layout[128];
+    if (appearance_gsettings("get", NULL, layout, sizeof layout)) {
+        int on = strstr(layout, "minimize") && strstr(layout, "maximize");
+        g_ui.toggles[TOG_WINDOW_BUTTONS] = on ? 1 : 0;
+    }
+    return loaded;
 }
 
 static void
@@ -3096,12 +3146,31 @@ appearance_save(void)
     fprintf(f, "# Written by jtsettings, read by jtlabwc.\n");
     fprintf(f, "accent_border_animation=%s\n",
             g_ui.toggles[TOG_BORDER_ANIM] ? "true" : "false");
+    fprintf(f, "window_buttons=%s\n",
+            g_ui.toggles[TOG_WINDOW_BUTTONS] ? "true" : "false");
     fclose(f);
 }
 
 static void
-appearance_commit(void)
+appearance_commit(int toggle)
 {
+    if (toggle == TOG_WINDOW_BUTTONS) {
+        const char *layout = g_ui.toggles[TOG_WINDOW_BUTTONS]
+            ? "'appmenu:minimize,maximize,close'" : "'appmenu:close'";
+        if (!appearance_gsettings("set", layout, NULL, 0)) {
+            /* Keep the switch in sync with what actually got applied. */
+            g_ui.toggles[TOG_WINDOW_BUTTONS] =
+                !g_ui.toggles[TOG_WINDOW_BUTTONS];
+            ui_toast("Could not update window buttons via gsettings");
+            return;
+        }
+        appearance_save();
+        ui_toast(g_ui.toggles[TOG_WINDOW_BUTTONS]
+                 ? "Window buttons enabled"
+                 : "Window buttons disabled");
+        return;
+    }
+
     appearance_save();
     jtlabwc_reload();
     jtfiles_reload();
@@ -5308,7 +5377,7 @@ static void page_displays(cairo_t *cr)
 /* ------------------------------------------------------------------ */
 
 #define APPEARANCE_TOP           102.0
-#define APPEARANCE_CONTENT_BOTTOM 310.0
+#define APPEARANCE_CONTENT_BOTTOM 550.0
 #define APPEARANCE_VIEW_BOTTOM   (WIN_H - 12.0)
 
 static void appearance_geom(double *top, double *bottom, double *view_h)
@@ -5368,6 +5437,26 @@ static void page_appearance(cairo_t *cr)
         "The border switch is applied by jtlabwc immediately. Accent colours "
         "come from JTLab and its live control socket.",
         8.8, 400, C_FAINT, 0.8, CONTENT_X, cy + ch + 20.0, CONTENT_W, 2);
+
+    section_label(cr, "WINDOW BUTTONS", CONTENT_X, 326.0);
+
+    double wy = 346.0;
+    double wh = 142.0;
+    paint_card(cr, CONTENT_X, wy, CONTENT_W, wh);
+
+    text_draw(cr, "GTK applications", 12.0, 600, 0xE8E8E8, 0.95,
+              lx, wy + 14.0, ALIGN_LEFT, 0.1);
+    paint_toggle_row(cr, lx, wy + 46.0, inner, "Minimize and maximize",
+                     "Show window controls in client-side decorated apps",
+                     g_ui.toggles[TOG_WINDOW_BUTTONS], TOG_WINDOW_BUTTONS);
+    paint_divider(cr, lx, wy + 96.0, inner);
+    text_draw(cr, "Restart open apps to pick up the new layout", 8.8, 400,
+              C_DIM, 0.8, lx, wy + 106.0, ALIGN_LEFT, 0.1);
+
+    text_wrap(cr,
+        "Browsers and other GTK apps draw their own titlebar. This sets "
+        "org.gnome.desktop.wm.preferences button-layout with gsettings.",
+        8.8, 400, C_FAINT, 0.8, CONTENT_X, wy + wh + 20.0, CONTENT_W, 2);
 
     g_hit_dy = 0.0;
     g_hit_clip_top = -1.0;
@@ -7208,8 +7297,9 @@ static void ui_activate(App *a, int idx)
             g_ui.toggles[h->a] = !g_ui.toggles[h->a];
             if (input_toggle(h->a))
                 input_commit();
-            else if (h->a == TOG_BORDER_ANIM)
-                appearance_commit();
+            else if (h->a == TOG_BORDER_ANIM ||
+                     h->a == TOG_WINDOW_BUTTONS)
+                appearance_commit(h->a);
         }
         break;
     case HIT_START_TOGGLE:
