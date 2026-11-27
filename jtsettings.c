@@ -527,29 +527,29 @@ static double text_wrap(cairo_t *cr, const char *text, double size, int weight,
 /* ------------------------------------------------------------------ */
 
 enum {
+    PAGE_APPEARANCE,
     PAGE_KEYBINDINGS,
     PAGE_STARTUP,
     PAGE_DEFAULT_APPS,
     PAGE_INPUT,
     PAGE_DISPLAYS,
-    PAGE_APPEARANCE,
     PAGE_PROFILE,
     PAGE_ABOUT,
     PAGE_COUNT
 };
 
 static const char *PAGE_NAMES[PAGE_COUNT] = {
-    "Keybindings", "Startup Apps", "Default Apps", "Input", "Displays",
-    "Appearance", "Profile", "About",
+    "Appearance", "Keybindings", "Startup Apps", "Default Apps", "Input",
+    "Displays", "Profile", "About",
 };
 
 static const char *PAGE_SUBS[PAGE_COUNT] = {
+    "Accent, window borders and frame styling",
     "Every shortcut jtlabwc listens for",
     "Programs launched together with your session",
     "Handlers for links, files, media and the terminal",
     "Pointer, touchpad and keyboard behaviour",
     "Outputs, resolution, refresh rate and scale",
-    "Accent, window borders and frame styling",
     "Weather location, units and your JTLab avatar",
     "Version and build information",
 };
@@ -9769,8 +9769,8 @@ static void usage(const char *argv0)
         "       %s --screenshot FILE [--page NAME]\n"
         "\n"
         "  rainbow        cycle the accent (or --rainbow)\n"
-        "Pages: keybindings, startup, apps, input, displays,\n"
-        "       appearance, profile, about\n",
+        "Pages: appearance, keybindings, startup, apps, input,\n"
+        "       displays, profile, about\n",
         argv0, argv0);
 }
 
