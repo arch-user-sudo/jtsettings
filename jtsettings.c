@@ -164,6 +164,12 @@ static unsigned accent_rgb = 0xE8A03C;
 static unsigned accent_hi_rgb = 0xF2B25C;
 static unsigned accent_lo_rgb = 0xCE8A2F;
 static unsigned on_accent_rgb = 0x14100A;
+/* Rainbow mode cycles the accent; the base colour is restored when it is
+ * switched off so an explicit accent is never lost. */
+static unsigned accent_base_rgb = 0xE8A03C;
+static int rainbow_mode = 0;
+static double rainbow_start = 0.0;
+static int accent_cli_explicit;
 #define C_ACCENT    accent_rgb
 #define C_ACCENT_HI accent_hi_rgb
 #define C_ACCENT_LO accent_lo_rgb
@@ -274,12 +280,71 @@ static unsigned accent_mix(unsigned rgb, unsigned toward, double amount)
     return (r << 16) | (g << 8) | b;
 }
 
-static void accent_set(unsigned rgb)
+/* One full hue wheel every eight seconds, rendered as a saturated RGB
+ * triple.  t is seconds since rainbow mode was switched on. */
+static unsigned rainbow_color(double t)
+{
+    double phase = fmod(t, 8.0);
+    if (phase < 0.0)
+        phase += 8.0;
+    double h = phase * 0.75;
+    int i = (int)h;
+    double f = h - i;
+    double q = 1.0 - f;
+    double r = 0.0, g = 0.0, b = 0.0;
+    switch (i) {
+    case 0: r = 1.0; g = f;   b = 0.0; break;
+    case 1: r = q;   g = 1.0; b = 0.0; break;
+    case 2: r = 0.0; g = 1.0; b = f;   break;
+    case 3: r = 0.0; g = q;   b = 1.0; break;
+    case 4: r = f;   g = 0.0; b = 1.0; break;
+    default:r = 1.0; g = 0.0; b = q;   break;
+    }
+    return ((unsigned)lround(r * 255.0) << 16) |
+           ((unsigned)lround(g * 255.0) << 8) |
+           (unsigned)lround(b * 255.0);
+}
+
+static void accent_apply(unsigned rgb)
 {
     accent_rgb = rgb;
     accent_hi_rgb = accent_mix(rgb, 0xFFFFFF, 0.16);
     accent_lo_rgb = accent_mix(rgb, 0x000000, 0.14);
     on_accent_rgb = accent_ink(rgb);
+}
+
+static void accent_set(unsigned rgb)
+{
+    accent_base_rgb = rgb;
+    accent_apply(rgb);
+}
+
+static void rainbow_set(int on, double t)
+{
+    int was_on = rainbow_mode;
+    rainbow_mode = on ? 1 : 0;
+    if (rainbow_mode) {
+        if (!was_on) {
+            accent_base_rgb = accent_rgb;
+            rainbow_start = t;
+            accent_apply(rainbow_color(0.0));
+        }
+    } else if (was_on) {
+        accent_apply(accent_base_rgb);
+    }
+}
+
+/* Returns 1 only when the displayed hue changed. The main loop uses this to
+ * request exactly one repaint per visible colour step. */
+static int accent_tick(double t)
+{
+    if (!rainbow_mode)
+        return 0;
+    unsigned rgb = rainbow_color(t - rainbow_start);
+    if (rgb == accent_rgb)
+        return 0;
+    accent_apply(rgb);
+    return 1;
 }
 
 /* Remove a leading '#RRGGBB', a bare RRGGBB, or an explicit --accent COLOR. */
@@ -288,6 +353,15 @@ static int accent_cli(int *argc, char **argv)
     for (int i = 1; i < *argc; i++) {
         const char *value = NULL;
         int consumed = 0;
+
+        if (!strcmp(argv[i], "--rainbow") || !strcmp(argv[i], "rainbow")) {
+            rainbow_set(1, mono_sec());
+            for (int j = i; j + 1 < *argc; j++)
+                argv[j] = argv[j + 1];
+            (*argc)--;
+            i--;
+            continue;
+        }
 
         if (!strcmp(argv[i], "--accent")) {
             if (i + 1 >= *argc) {
@@ -319,6 +393,10 @@ static int accent_cli(int *argc, char **argv)
                     argv[0], value);
             return 0;
         }
+        /* An explicit colour always takes over from a launch-time rainbow. */
+        accent_cli_explicit = 1;
+        if (rainbow_mode)
+            rainbow_mode = 0;
         accent_set(rgb);
 
         for (int j = i; j + consumed < *argc; j++)
@@ -487,6 +565,7 @@ enum {
     TOG_PRIMARY_B,
     TOG_BORDER_ANIM,
     TOG_WINDOW_BUTTONS,
+    TOG_RAINBOW,
     TOG_COUNT
 };
 
@@ -971,6 +1050,7 @@ static void ui_init(void)
     g_ui.toggles[TOG_PRIMARY_B] = 0;
     g_ui.toggles[TOG_BORDER_ANIM] = 0;
     g_ui.toggles[TOG_WINDOW_BUTTONS] = 1;
+    g_ui.toggles[TOG_RAINBOW] = 0;
 
     g_ui.sliders[SL_POINTER] = 0.52;
     g_ui.sliders[SL_REPEAT] = (45.0 - 15.0) / 65.0;
@@ -2993,11 +3073,10 @@ input_load(void)
     return 1;
 }
 
-/* Ask a companion app to re-read its configuration files.  A missing app is
- * not an error: the settings stay on disk and are picked up at the next
- * session start. */
+/* Send one line to a companion app's control socket. A missing app is not an
+ * error: the shared config is still written for the next session start. */
 static void
-app_reload(const char *sockname)
+app_send(const char *sockname, const char *msg)
 {
     const char *rt = getenv("XDG_RUNTIME_DIR");
     char path[256];
@@ -3012,12 +3091,13 @@ app_reload(const char *sockname)
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return;
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
-        static const char msg[] = "reload\n";
-        (void)!write(fd, msg, sizeof msg - 1);
-    }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0)
+        (void)!write(fd, msg, strlen(msg));
     close(fd);
 }
+
+/* Ask a companion app to re-read its configuration files. */
+static void app_reload(const char *sockname) { app_send(sockname, "reload\n"); }
 
 static void jtlabwc_reload(void) { app_reload("jtlabwc-ctl.sock"); }
 static void jtfiles_reload(void) { app_reload("jtfiles-ctl.sock"); }
@@ -3038,6 +3118,8 @@ input_commit(void)
 #define APPEARANCE_DIR       "jt"
 #define APPEARANCE_FILE      "appearance.conf"
 #define APPEARANCE_PATH_MAX  512
+/* Shared with jtgreeter and JTLab; read by them at boot/startup. */
+#define RAINBOW_SYSTEM_CONF  "/etc/jt/rainbow.conf"
 
 /* Keep this path and the keys in sync with jtlabwc.c. */
 static void
@@ -3045,6 +3127,79 @@ appearance_config_path(char *buf, size_t n)
 {
     snprintf(buf, n, "%s/.config/%s/%s", user_home(),
              APPEARANCE_DIR, APPEARANCE_FILE);
+}
+
+/* Shared boot flag: only "rainbow=on" and "rainbow=off" are valid. */
+static int
+rainbow_value(const char *s)
+{
+    static const char prefix[] = "rainbow=";
+    if (strncmp(s, prefix, sizeof(prefix) - 1))
+        return -1;
+    s += sizeof(prefix) - 1;
+    char value[16];
+    snprintf(value, sizeof value, "%s", s);
+    char *end = value + strlen(value);
+    while (end > value && (end[-1] == '\r' || end[-1] == '\n'))
+        *--end = '\0';
+    if (!strcmp(value, "on"))
+        return 1;
+    if (!strcmp(value, "off"))
+        return 0;
+    return -1;
+}
+
+/* Returns 1/0 for a valid shared setting, -1 when the file is absent/invalid. */
+static int
+rainbow_system_read(void)
+{
+    FILE *f = fopen(RAINBOW_SYSTEM_CONF, "r");
+    if (!f)
+        return -1;
+    char line[128];
+    int on = -1;
+    if (fgets(line, sizeof line, f))
+        on = rainbow_value(line);
+    fclose(f);
+    return on;
+}
+
+/* Mirror the toggle into the file jtgreeter and JTLab read at startup. */
+static int
+rainbow_system_write(int on)
+{
+    if (mkdir("/etc/jt", 0755) != 0 && errno != EEXIST)
+        return 0;
+    FILE *f = fopen(RAINBOW_SYSTEM_CONF, "w");
+    if (!f)
+        return 0;
+    fprintf(f, "rainbow=%s\n", on ? "on" : "off");
+    int ok = ferror(f) == 0;
+    if (fclose(f) != 0)
+        ok = 0;
+    if (ok)
+        chmod(RAINBOW_SYSTEM_CONF, 0666);
+    return ok;
+}
+
+/* Hand the toggle to the bar. jtlabctl is the only live signal: the rest of
+ * the desktop follows JTLab's accent, so no per-app broadcast is needed. */
+static void
+rainbow_notify_bar(int on)
+{
+    char state[4];
+    snprintf(state, sizeof state, "%s", on ? "on" : "off");
+    gchar *argv[] = {
+        (gchar *)"/usr/local/bin/jtlabctl", (gchar *)"rainbow",
+        (gchar *)state, NULL
+    };
+    GError *err = NULL;
+    if (!g_spawn_async(NULL, argv, NULL,
+                       G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                       NULL, NULL, NULL, &err)) {
+        if (err)
+            g_error_free(err);
+    }
 }
 
 /* GTK and other client-side-decorated apps read this key when they start. */
@@ -3116,10 +3271,28 @@ appearance_load(void)
                     g_ui.toggles[TOG_WINDOW_BUTTONS] = 1;
                 else if (!strcasecmp(value, "false") || !strcmp(value, "0"))
                     g_ui.toggles[TOG_WINDOW_BUTTONS] = 0;
+            } else if (!strcasecmp(key, "rainbow")) {
+                int on = !strcasecmp(value, "true") || !strcmp(value, "1");
+                int off = !strcasecmp(value, "false") || !strcmp(value, "0");
+                /* A command-line accent overrides a saved rainbow mode. */
+                if (on && !accent_cli_explicit)
+                    rainbow_set(1, mono_sec());
+                if (on || off)
+                    g_ui.toggles[TOG_RAINBOW] = rainbow_mode ? 1 : 0;
             }
         }
         fclose(f);
         loaded = 1;
+    }
+
+    /* The shared boot flag is authoritative when present, so the Appearance
+     * toggle matches what jtgreeter and JTLab will load. */
+    if (!accent_cli_explicit) {
+        int shared = rainbow_system_read();
+        if (shared >= 0) {
+            rainbow_set(shared, mono_sec());
+            g_ui.toggles[TOG_RAINBOW] = rainbow_mode ? 1 : 0;
+        }
     }
 
     /* The effective GTK layout wins over the saved preference, so the switch
@@ -3148,12 +3321,29 @@ appearance_save(void)
             g_ui.toggles[TOG_BORDER_ANIM] ? "true" : "false");
     fprintf(f, "window_buttons=%s\n",
             g_ui.toggles[TOG_WINDOW_BUTTONS] ? "true" : "false");
+    fprintf(f, "rainbow=%s\n",
+            g_ui.toggles[TOG_RAINBOW] ? "true" : "false");
     fclose(f);
 }
 
 static void
 appearance_commit(int toggle)
 {
+    if (toggle == TOG_RAINBOW) {
+        rainbow_set(g_ui.toggles[TOG_RAINBOW], mono_sec());
+        g_ui.toggles[TOG_RAINBOW] = rainbow_mode ? 1 : 0;
+        appearance_save();
+        int saved = rainbow_system_write(g_ui.toggles[TOG_RAINBOW]);
+        rainbow_notify_bar(g_ui.toggles[TOG_RAINBOW]);
+        if (!saved)
+            ui_toast("Could not update shared rainbow setting");
+        else
+            ui_toast(g_ui.toggles[TOG_RAINBOW]
+                     ? "Rainbow accent enabled"
+                     : "Rainbow accent disabled");
+        return;
+    }
+
     if (toggle == TOG_WINDOW_BUTTONS) {
         const char *layout = g_ui.toggles[TOG_WINDOW_BUTTONS]
             ? "'appmenu:minimize,maximize,close'" : "'appmenu:close'";
@@ -5377,7 +5567,7 @@ static void page_displays(cairo_t *cr)
 /* ------------------------------------------------------------------ */
 
 #define APPEARANCE_TOP           102.0
-#define APPEARANCE_CONTENT_BOTTOM 550.0
+#define APPEARANCE_CONTENT_BOTTOM 590.0
 #define APPEARANCE_VIEW_BOTTOM   (WIN_H - 12.0)
 
 static void appearance_geom(double *top, double *bottom, double *view_h)
@@ -5421,7 +5611,7 @@ static void page_appearance(cairo_t *cr)
     section_label(cr, "WINDOW BORDERS", CONTENT_X, 102.0);
 
     double cy = 122.0;
-    double ch = 142.0;
+    double ch = 180.0;
     paint_card(cr, CONTENT_X, cy, CONTENT_W, ch);
 
     text_draw(cr, "Focus accent", 12.0, 600, 0xE8E8E8, 0.95,
@@ -5429,18 +5619,22 @@ static void page_appearance(cairo_t *cr)
     paint_toggle_row(cr, lx, cy + 46.0, inner, "Border animation",
                      "Sweep the accent around the frame when focus changes",
                      g_ui.toggles[TOG_BORDER_ANIM], TOG_BORDER_ANIM);
-    paint_divider(cr, lx, cy + 96.0, inner);
+    paint_divider(cr, lx, cy + 90.0, inner);
+    paint_toggle_row(cr, lx, cy + 100.0, inner, "Rainbow mode",
+                     "Cycle the accent through the colour wheel",
+                     g_ui.toggles[TOG_RAINBOW], TOG_RAINBOW);
+    paint_divider(cr, lx, cy + 144.0, inner);
     text_draw(cr, "Saved to ~/.config/jt/appearance.conf", 8.8, 400,
-              C_DIM, 0.8, lx, cy + 106.0, ALIGN_LEFT, 0.1);
+              C_DIM, 0.8, lx, cy + 154.0, ALIGN_LEFT, 0.1);
 
     text_wrap(cr,
         "The border switch is applied by jtlabwc immediately. Accent colours "
         "come from JTLab and its live control socket.",
         8.8, 400, C_FAINT, 0.8, CONTENT_X, cy + ch + 20.0, CONTENT_W, 2);
 
-    section_label(cr, "WINDOW BUTTONS", CONTENT_X, 326.0);
+    section_label(cr, "WINDOW BUTTONS", CONTENT_X, 364.0);
 
-    double wy = 346.0;
+    double wy = 384.0;
     double wh = 142.0;
     paint_card(cr, CONTENT_X, wy, CONTENT_W, wh);
 
@@ -7299,7 +7493,8 @@ static void ui_activate(App *a, int idx)
             if (input_toggle(h->a))
                 input_commit();
             else if (h->a == TOG_BORDER_ANIM ||
-                     h->a == TOG_WINDOW_BUTTONS)
+                     h->a == TOG_WINDOW_BUTTONS ||
+                     h->a == TOG_RAINBOW)
                 appearance_commit(h->a);
         }
         break;
@@ -9068,6 +9263,29 @@ static void ctl_handle_line(App *a, char *line)
         return;
     }
 
+    if (!strncmp(line, "rainbow", 7) &&
+        (line[7] == '\0' || line[7] == ' ' || line[7] == '\t')) {
+        const char *arg = line + 7;
+        while (*arg == ' ' || *arg == '\t' || *arg == '\r' || *arg == '\n')
+            arg++;
+        int on;
+        if (!*arg || !strcmp(arg, "toggle"))
+            on = !rainbow_mode;
+        else if (!strcmp(arg, "on"))
+            on = 1;
+        else if (!strcmp(arg, "off"))
+            on = 0;
+        else
+            return;
+        rainbow_set(on, mono_sec());
+        g_ui.toggles[TOG_RAINBOW] = rainbow_mode ? 1 : 0;
+        appearance_save();
+        rainbow_system_write(g_ui.toggles[TOG_RAINBOW]);
+        rainbow_notify_bar(g_ui.toggles[TOG_RAINBOW]);
+        a->dirty = 1;
+        return;
+    }
+
     if (strncmp(line, "accent", 6) == 0 &&
         (line[6] == ' ' || line[6] == '\t')) {
         const char *arg = line + 6;
@@ -9075,7 +9293,13 @@ static void ctl_handle_line(App *a, char *line)
             arg++;
         unsigned rgb;
         if (accent_parse(arg, &rgb)) {
+            if (rainbow_mode)
+                rainbow_set(0, mono_sec());  /* an explicit colour takes over */
+            g_ui.toggles[TOG_RAINBOW] = 0;
             accent_set(rgb);
+            appearance_save();
+            rainbow_system_write(0);
+            rainbow_notify_bar(0);
             a->dirty = 1;
         }
         return;
@@ -9541,9 +9765,10 @@ static int write_screenshot(const char *path, int page)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s [#RRGGBB] [--accent #RRGGBB] [--page NAME]\n"
+        "usage: %s [#RRGGBB] [--accent #RRGGBB] [rainbow] [--page NAME]\n"
         "       %s --screenshot FILE [--page NAME]\n"
         "\n"
+        "  rainbow        cycle the accent (or --rainbow)\n"
         "Pages: keybindings, startup, apps, input, displays,\n"
         "       appearance, profile, about\n",
         argv0, argv0);
@@ -9634,6 +9859,11 @@ int main(int argc, char **argv)
             g_profile_dirty = 0;
         }
 
+        /* Rainbow is a 10 Hz colour clock, not a 60 Hz animation: only a
+         * visible RGB change requests a repaint. */
+        if (rainbow_mode && accent_tick(mono_sec()))
+            a.dirty = 1;
+
         int animating = ui_animating();
 
         if (a.configured && (a.dirty || animating) && !a.frame_cb) {
@@ -9646,7 +9876,7 @@ int main(int argc, char **argv)
          * freeze the UI; when truly idle we block until input or a control
          * command arrives. */
         int timeout;
-        if (!a.configured || animating || a.dirty)
+        if (!a.configured || animating || rainbow_mode || a.dirty)
             timeout = 100;
         else
             timeout = -1;

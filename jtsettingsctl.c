@@ -3,6 +3,7 @@
  * Usage:
  *   jtsettingsctl accent '#RRGGBB'   change the accent live
  *   jtsettingsctl '#RRGGBB'          shorthand for the same
+ *   jtsettingsctl rainbow [on|off|toggle]  cycle accent colours
  *   jtsettingsctl page keybindings   switch pages
  *   jtsettingsctl apply              apply pending display changes
  *   jtsettingsctl reset              discard pending display changes
@@ -70,8 +71,8 @@ main(int argc, char **argv)
 
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s accent '#RRGGBB' | page NAME | apply | reset | "
-            "dump | quit\n", argv[0]);
+            "usage: %s accent '#RRGGBB' | rainbow [on|off|toggle] | "
+            "page NAME | apply | reset | dump | quit\n", argv[0]);
         return 2;
     }
 
@@ -81,6 +82,17 @@ main(int argc, char **argv)
             ok = 0;
         else
             ok = build_line(line, sizeof line, "accent %s\n", argv[2]);
+    } else if (!strcmp(argv[1], "rainbow")) {
+        if (argc == 2) {
+            ok = build_line(line, sizeof line, "rainbow\n");
+        } else if (argc == 3 &&
+                   (!strcmp(argv[2], "on") || !strcmp(argv[2], "off") ||
+                    !strcmp(argv[2], "toggle"))) {
+            ok = build_line(line, sizeof line, "rainbow %s\n", argv[2]);
+        } else {
+            fprintf(stderr, "%s: rainbow takes on, off or toggle\n", argv[0]);
+            return 2;
+        }
     } else if (!strcmp(argv[1], "page") && argc >= 3) {
         if (!clean_arg(argv[2]))
             ok = 0;
